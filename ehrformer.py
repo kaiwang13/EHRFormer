@@ -4,6 +4,41 @@ from einops import rearrange
 from transformers import BertConfig
 from flash_attn.models.bert import BertEncoder, BertModel
 
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.lambda_
+        return output, None
+        
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_=1.0):
+        super(GradientReversalLayer, self).__init__()
+        self.lambda_ = lambda_
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+        
+class DomainDiscriminator(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.output_dim = config['output_dim']
+        self.proj_dim = config['proj_dim']
+        self.grl = GradientReversalLayer()
+        self.fc = nn.Sequential(
+            nn.Linear(self.output_dim, self.proj_dim),
+            nn.ReLU(),
+            nn.Linear(self.proj_dim, 4)
+        )
+    def forward(self, x):
+        x = self.grl(x)
+        x = self.fc(x)
+        return x
+        
 class MultiTaskHead(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -225,7 +260,9 @@ class EHRVAE1D(nn.Module):
         h_cls = h[:, :self.n_cls, :]
         h_reg = h[:, self.n_cls:, :]
         y_cls, y_reg = self.head(h_cls, h_reg)
-        return y_cls, y_reg, mu_z, std_z
+        
+        domain_output = self.discriminator(h)
+        return y_cls, y_reg, mu_z, std_z, domain_output
     
     def forward_mu(self, cat_feats, float_feats):
         mu_z = self.ehr_mu(cat_feats, float_feats)
