@@ -1,0 +1,52 @@
+{
+    "debug": false,
+    "project": "ehrformer-finetune",
+    "stage": "pretrain",
+    "name": "ehrformer",
+    "model": "ehrformer",
+    "output_dir": "output/finetune",
+    "n_gpus": [
+        0,1,2,3,4,5,6,7
+    ],
+    "n_epoch": 300,
+    "train": true,
+    "test": false,
+    "lr": 0.0001,
+    "wd": 0.05,
+    "output_dim": 768,
+    "proj_dim": 256,
+    "n_category_feats": 1,
+    "n_float_feats": 286,
+    "n_category_values": 2,
+    "n_float_values": 256,
+    "seq_max_len": 16,
+    "df_path": "path/to/dataframe",
+    "use_cache": false,
+    "dataset_col": "dataset_fold10",
+    "batch_size": 768,
+    "train_folds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+    ],
+    "valid_folds": [
+        0
+    ],
+    "test_folds": [
+        0,1,2,3,4,5,6,7,8,9
+    ],
+    "cls_label_cols": ["c_cls_labels", "f_cls_labels"],
+    "cls_label_name_cols": ["diag_cols", "diag_cols"],
+    "cls_label_n_cls": [2, 2],
+    "reg_label_cols": ["c_reg_labels"],
+    "reg_label_name_cols": ["reg_cols"],
+    "reg_label_info": [
+        [47.532440854773434, 18.01090889843563]
+    ]
+}

@@ -77,7 +77,7 @@ def main(config):
 
 
 if __name__ == '__main__':
-    config = json_load('configs/train.json')
+    config = json_load('configs/pretrain.json')
     config['transformer'] = GPT2Config.from_pretrained('gpt2')
     config['transformer'].n_positions = 8192
     config['feat_info'] = json_load(config['feat_info_path'])
