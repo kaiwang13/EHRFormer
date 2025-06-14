@@ -1,7 +1,6 @@
 from collections import defaultdict
 from functools import reduce
 from pathlib import Path
-from einops import rearrange
 import pandas as pd
 import pytorch_lightning as pl
 from sklearn.metrics import precision_recall_curve
@@ -16,8 +15,10 @@ from ddp_Utils import *
 from pytorch_lightning.loggers import WandbLogger
 import numpy as np
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
-from ehrformer import EHRVAE2D
+from ehrformer import EHRVAE1D
 from Utils import str_hash
+import gc
+from tqdm import tqdm
 
 
 class EHRModule(pl.LightningModule):
@@ -38,13 +39,14 @@ class EHRModule(pl.LightningModule):
         self.cls_label_names = config.get('cls_label_names', [])
         self.reg_label_names = config.get('reg_label_names', [])
         
-        self.model = EHRVAE2D(config)
+        self.model = EHRVAE1D(config)
 
         self.output_dir = config.get('output_dir', None)
         if self.output_dir is not None:
             self.output_dir = Path(self.output_dir) / 'pred'
             self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.pred_folder = 'pred'
+        
+        self.pred_folder = config.get('pred_folder', 'pred')
 
     def configure_optimizers(self):
         optimizer = AdamW(
@@ -76,13 +78,13 @@ class EHRModule(pl.LightningModule):
         
         cat_feats = data['cat_feats']  
         float_feats = data['float_feats']  
-        time_index = data['time_index']  
-        valid_mask = data['valid_mask']  
         reg_label = label['float_feats']  
-        cls_label = label['cat_feats']  
         reg_mask = label['float_valid_mask']  
 
-        y_cls, y_reg, mu_z, std_z = self.model(cat_feats, float_feats, time_index, valid_mask)
+        cls_label = label['cat_feats']  
+        cls_mask = label['cat_valid_mask']  
+
+        y_cls, y_reg, mu_z, std_z = self.model(cat_feats, float_feats)
         y_reg_loss = y_reg.reshape(-1)
         reg_label_loss = reg_label.reshape(-1)
         reg_mask_loss = reg_mask.reshape(-1)
@@ -91,7 +93,9 @@ class EHRModule(pl.LightningModule):
 
         y_cls_loss = y_cls.reshape(-1, 2)
         cls_label_loss = cls_label.reshape(-1)
-        cls_loss = F.cross_entropy(y_cls_loss, cls_label_loss)
+        cls_mask_loss = cls_mask.reshape(-1)
+        cls_losses = F.cross_entropy(y_cls_loss, cls_label_loss, reduction='none')
+        cls_loss = (cls_losses * cls_mask_loss).sum() / (cls_mask_loss.sum().clip(1))
 
         temp = 1 + std_z - mu_z.pow(2) - std_z.exp()
         loss_kld = -0.5 * torch.mean(temp.mean(-1).mean())
@@ -110,73 +114,63 @@ class EHRModule(pl.LightningModule):
         
         cat_feats = data['cat_feats']  
         float_feats = data['float_feats']  
-        float_feats = data['float_feats']  
-        time_index = data['time_index']  
-        valid_mask = data['valid_mask']  
         reg_label = label['float_feats']  
-        cls_label = label['cat_feats']  
-        cls_mask = label['cat_valid_mask']  
         reg_mask = label['float_valid_mask']  
 
-        y_cls, y_reg, mu_z, std_z = self.model(cat_feats, float_feats, time_index, valid_mask)
+        cls_label = label['cat_feats']  
+        cls_mask = label['cat_valid_mask']  
+
+        y_cls, y_reg, mu_z, std_z = self.model(cat_feats, float_feats)
         y_reg_loss = y_reg.reshape(-1)
         reg_label_loss = reg_label.reshape(-1)
         reg_mask_loss = reg_mask.reshape(-1)
         reg_losses = F.mse_loss(y_reg_loss, reg_label_loss, reduction='none')
         reg_loss = (reg_losses * reg_mask_loss).sum() / (reg_mask_loss.sum().clip(1))
 
-        cls_label_flat = cls_label.reshape(-1)
-        cls_mask_flat = cls_mask.reshape(-1)
-        y_cls_flat = y_cls.reshape(-1, 2)
-        cls_losses = F.cross_entropy(y_cls_flat, cls_label_flat, reduction='none')
-        cls_loss = (cls_losses * cls_mask_flat).sum() / (cls_mask_flat.sum().clip(1))
-
-        
-        
-        
+        y_cls_loss = y_cls.reshape(-1, 2)
+        cls_label_loss = cls_label.reshape(-1)
+        cls_mask_loss = cls_mask.reshape(-1)
+        cls_losses = F.cross_entropy(y_cls_loss, cls_label_loss, reduction='none')
+        cls_loss = (cls_losses * cls_mask_loss).sum() / (cls_mask_loss.sum().clip(1))
 
         temp = 1 + std_z - mu_z.pow(2) - std_z.exp()
         loss_kld = -0.5 * torch.mean(temp.mean(-1).mean())
 
         loss = cls_loss + reg_loss + loss_kld
-        B = cat_feats.shape[0]
-        cls_label_perf = rearrange(cls_label, 'b n l -> (b l) n', b=B)
-        cls_mask_perf = rearrange(valid_mask, 'b l -> (b l) 1', b=B)
-        reg_label_perf = rearrange(reg_label, 'b n l -> (b l) n', b=B)
-        reg_mask_perf = rearrange(reg_mask, 'b n l -> (b l) n', b=B)
+
         tensor_to_gather = [
-            cls_label_perf.contiguous(), cls_mask_perf.contiguous(),
-            reg_label_perf.contiguous(), reg_mask_perf.contiguous(),
+            cls_label.contiguous(), cls_mask.contiguous(),
+            reg_label.contiguous(), reg_mask.contiguous(),
             y_cls.contiguous(), y_reg.contiguous()
         ]
         tensor_gathered = [x.cpu() for x in all_gather(tensor_to_gather)]
-        cls_label_perf = tensor_gathered[0]
-        cls_mask_perf = tensor_gathered[1]
-        reg_label_perf = tensor_gathered[2]
-        reg_mask_perf = tensor_gathered[3]
-        
+        cls_label = tensor_gathered[0]
+        cls_mask = tensor_gathered[1]
+
+        reg_label = tensor_gathered[2]
+        reg_mask = tensor_gathered[3]
         y_cls = tensor_gathered[4]
         y_reg = tensor_gathered[5]
 
         for i in range(len(self.cls_label_names)):
-            mask = cls_mask_perf[:, i]
+            mask = cls_mask[:, i]
 
-            pp = y_cls[:, i, 1]
-            pp = pp[mask]
+            pp = y_cls[:, i, :]
+            pp = pp[mask, :]
 
-            yy = cls_label_perf[:, i]
+            yy = cls_label[:, i]
             yy = yy[mask]
-
-            self.preds[f'cls_{i}'].append(pp)
-            self.targets[f'cls_{i}'].append(yy)
+            if len(pp) > 2:
+                self.preds[f'cls_{i}'].append(pp[:, 1])
+                self.targets[f'cls_{i}'].append(yy)
 
         for i in range(len(self.reg_label_names)):
-            mask = reg_mask_perf[:, i]
+            mask = reg_mask[:, i]
 
             pp = y_reg[:, i]
             pp = pp[mask]
 
-            yy = reg_label_perf[:, i]
+            yy = reg_label[:, i]
             yy = yy[mask]
             if len(pp) > 2:
                 self.preds[f'reg_{i}'].append(pp)
@@ -220,16 +214,11 @@ class EHRModule(pl.LightningModule):
             if len(self.preds[f'reg_{i}']) != 0:
                 pred = dim_zero_cat(self.preds[f'reg_{i}']).double()
                 target = dim_zero_cat(self.targets[f'reg_{i}']).double()
-                mse = MF.mean_squared_error(pred, target)
-                pcc = MF.pearson_corrcoef(pred, target)
-                r2 = MF.r2_score(pred, target)
-                self.log(f"val_{k}_mse", mse, prog_bar=False, rank_zero_only=True)
-                self.log(f"val_{k}_pcc", pcc, prog_bar=False, rank_zero_only=True)
-                self.log(f"val_{k}_r2", r2, prog_bar=False, rank_zero_only=True)
-                if not torch.isnan(pcc).any() and pcc > 0:
-                    mpcc.append(pcc)
-                if not torch.isnan(r2).any() and r2 > 0:
-                    mr2.append(r2)
+                self.log(f"val_{k}_mse", MF.mean_squared_error(pred, target), prog_bar=False, rank_zero_only=True)
+                self.log(f"val_{k}_pcc", MF.pearson_corrcoef(pred, target), prog_bar=False, rank_zero_only=True)
+                self.log(f"val_{k}_r2", MF.r2_score(pred, target), prog_bar=False, rank_zero_only=True)
+                mpcc.append(MF.pearson_corrcoef(pred, target))
+                mr2.append(MF.r2_score(pred, target))
         mpcc = sum(mpcc) / len(mpcc) if len(mpcc) != 0 else 0
         mr2 = sum(mr2) / len(mr2) if len(mr2) != 0 else 0
         self.log(f"val_mpcc", mpcc, prog_bar=False, rank_zero_only=True)
@@ -240,13 +229,95 @@ class EHRModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         data = batch['data']
+        pid = batch['pid']
+        vid = batch['vid']
+        
+        label = batch['label']
         
         cat_feats = data['cat_feats']  
         float_feats = data['float_feats']  
+        reg_label = label['float_feats']  
+        cls_label = label['cat_feats']  
+        reg_mask = label['float_valid_mask']  
 
-        mu_z = self.model.forward_mu(cat_feats, float_feats)
-        for i in range(len(batch['pid'])):
-            output_name = str_hash(batch['pid'][i]) % (10**32)
-            output_name = f'{output_name:032d}.npz'
-            mu_z_i = mu_z[i, :, :].detach().cpu().numpy()
-            np.savez_compressed(str(self.output_dir / output_name), mu_z_i)
+        y_cls, y_reg, _, _ = self.model(cat_feats, float_feats)
+        y_cls = y_cls.float()
+        y_reg = y_reg.float()
+        
+        self.test_outputs.append({
+            'pid': pid, 'vid': vid, 
+            
+            'cls_preds': torch.softmax(y_cls, dim=-1).cpu().numpy(), 
+            'cls_label': cls_label.cpu().numpy(), 
+            'reg_preds': y_reg.cpu().numpy(), 
+            'reg_label': reg_label.cpu().numpy(), 
+            'reg_mask': reg_mask.cpu().numpy()
+        })
+        
+        
+        if batch_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
+    def on_test_epoch_end(self):
+        output_dir = Path(self.output_dir) / self.pred_folder
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        
+        total_samples = sum(len(output['pid']) for output in self.test_outputs)
+        
+        all_pids = []
+        all_vids = []
+        
+        
+        n_cls = len(self.cls_label_names)
+        n_reg = len(self.reg_label_names)
+        
+        cls_probs = [np.zeros(total_samples) for _ in range(n_cls)]
+        cls_labels = [np.zeros(total_samples, dtype=int) for _ in range(n_cls)]
+        
+        reg_preds = [np.zeros(total_samples) for _ in range(n_reg)]
+        reg_masks = [np.zeros(total_samples, dtype=bool) for _ in range(n_reg)]
+        reg_labels = [np.zeros(total_samples) for _ in range(n_reg)]
+        
+        idx = 0
+        for output in tqdm(self.test_outputs):
+            batch_size = len(output['pid'])
+            
+            all_pids.extend(output['pid'])
+            all_vids.extend(output['vid'])
+
+            for i in range(n_cls):
+                cls_probs[i][idx:idx+batch_size] = output['cls_preds'][:, i, 1]
+                cls_labels[i][idx:idx+batch_size] = output['cls_label'][:, i]
+
+            for i in range(n_reg):
+                reg_preds[i][idx:idx+batch_size] = output['reg_preds'][:, i]
+                reg_masks[i][idx:idx+batch_size] = output['reg_mask'][:, i]
+                reg_labels[i][idx:idx+batch_size] = output['reg_label'][:, i]
+            
+            idx += batch_size
+        
+        mean_std = self.config['mean_std']
+        for i in range(n_reg):
+            reg_preds[i] = reg_preds[i] * mean_std[i, 1] + mean_std[i, 0]
+        
+        data_dict = {
+            'pid': all_pids,
+            'vid': all_vids,
+        }
+
+        for i, col in enumerate(self.cls_label_names):
+            data_dict[f"{col}_prob_1"] = cls_probs[i]
+            data_dict[col] = cls_labels[i]
+        
+        for i, col in enumerate(self.reg_label_names):
+            data_dict[f"{col}_prob_0"] = reg_preds[i]
+            data_dict[f"{col}_mask"] = reg_masks[i]
+            data_dict[col] = reg_labels[i]
+        
+        df = pd.DataFrame(data_dict)
+        output_path = output_dir / f'test_pred.{self.global_rank}.parquet'
+        df.to_parquet(output_path)
+        self.test_outputs.clear()
+        gc.collect()
+        torch.cuda.empty_cache()

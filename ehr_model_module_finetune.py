@@ -33,11 +33,8 @@ def group_by_M_dimension(A_list, B_list, C_list):
 
     return groups
 
-
 def group_by_M_dimension(A_list, B_list, C_list):
     device = A_list[0].device
-    
-    
     M_values = torch.tensor([A.size(1) for A in A_list], device=device)
     unique_M = torch.unique(M_values)
     
@@ -45,8 +42,6 @@ def group_by_M_dimension(A_list, B_list, C_list):
     for M in unique_M.cpu().numpy():
         mask = M_values == M
         indices = torch.where(mask)[0]
-        
-        
         groups[M] = (
             torch.cat([A_list[i] for i in indices], dim=0),
             torch.cat([B_list[i] for i in indices], dim=0),
@@ -64,11 +59,7 @@ class FocalLoss(nn.Module):
         
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        
         pt = torch.exp(-ce_loss)
-        
-        
         focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
         
         if self.reduction == 'none':
@@ -80,13 +71,11 @@ class FocalLoss(nn.Module):
         else:
             raise ValueError(f"Invalid reduction mode: {self.reduction}")
 
-
 def encode(nums):
     result = 0
     for num in nums:
         result = result * 41 + num
     return result
-
 
 def batch_top5_encode(probs: np.ndarray) -> np.ndarray:
     top5_indices = np.argsort(probs, axis=1)[:, -5:]  
@@ -128,7 +117,7 @@ class EHRModule(pl.LightningModule):
         self.n_cls = config.get('n_cls', [])
         self.cls_label_names = config.get('cls_label_names', [])
         self.reg_label_names = config.get('reg_label_names', [])
-        self.model = torch.compile(EHRFormer(config))
+        self.model = EHRFormer(config)
         
 
         self.criterion = FocalLoss(alpha=0.25, gamma=2, reduction='none')
@@ -187,7 +176,6 @@ class EHRModule(pl.LightningModule):
         cls_masks = cls_mask.reshape(cls_mask.shape[0], n_cls, -1).permute(1, 0, 2)
         cls_masks = [m.reshape(-1) for m in cls_masks]
 
-        
         cls_groups = group_by_M_dimension(cls_preds, cls_labels, cls_masks)
         cls_loss = sum((self.criterion(pred, label) * mask).sum() / mask.sum().clip(1)
                     for pred, label, mask in cls_groups.values())
@@ -238,57 +226,15 @@ class EHRModule(pl.LightningModule):
         cls_groups = group_by_M_dimension(cls_preds, cls_labels, cls_masks)
         cls_loss = sum((self.criterion(pred, label) * mask).sum() / mask.sum().clip(1)
                     for pred, label, mask in cls_groups.values())
-
         
         reg_preds = torch.stack([y_cls[i + n_cls].reshape(-1) for i in range(n_reg)], dim=0)
         reg_labels = reg_label.reshape(reg_label.shape[0], n_reg, -1).permute(1, 0, 2).reshape(n_reg, -1)
         reg_masks = reg_mask.reshape(reg_mask.shape[0], n_reg, -1).permute(1, 0, 2).reshape(n_reg, -1)
-        
-        
+
         reg_losses = F.mse_loss(reg_preds, reg_labels, reduction='none')
         reg_loss = (reg_losses * reg_masks).sum() / reg_masks.sum().clip(1)
 
         loss = cls_loss + reg_loss
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-
-        
-        
-        
-        
-        
-        
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
 
         loss = cls_loss + reg_loss
         tensor_to_gather = [
@@ -304,7 +250,6 @@ class EHRModule(pl.LightningModule):
 
         for i in range(len(self.cls_label_names)):
             mask = cls_mask[:, i, :]
-
             
             pp = y_cls[i]
             pp = pp[mask]
@@ -445,7 +390,6 @@ class EHRModule(pl.LightningModule):
         reg_mask = [torch.cat(x, dim=0).to('cpu') for x in reg_mask]
         reg_label = [torch.cat(x, dim=0).to('cpu') for x in reg_label]
 
-        
         pid = torch.cat([x['pid'] for x in self.test_outputs]).numpy()
 
         n_sample = len(pid)

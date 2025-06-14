@@ -1,12 +1,12 @@
 {
-    "debug": false,
+    "debug": true,
     "project": "ehrformer-pretrain",
     "stage": "pretrain",
     "name": "ehrformer",
     "model": "ehrformer",
     "output_dir": "output/pretrain",
     "n_gpus": [
-        0,1,2,3,4,5,6,7
+        7
     ],
     "n_epoch": 300,
     "train": true,
@@ -15,14 +15,13 @@
     "wd": 0.05,
     "output_dim": 768,
     "proj_dim": 768,
-    "n_category_feats": 28,
-    "n_float_feats": 150,
+    "n_category_feats": 1,
+    "n_float_feats": 4,
     "n_category_values": 2,
     "n_float_values": 256,
     "mask_ratio": 0.5,
     "pool_emb": false,
-    "df_path": "path/to/dataframe",
-    "train_length": 1,
+    "df_path": "/home/wkai/projects/EHRFormer_paper/data/pretrain/sample.parquet",
     "use_cache": false,
     "dataset_col": "dataset_fold10",
     "batch_size": 768,
@@ -43,8 +42,8 @@
     "test_folds": [
         0,1,2,3,4,5,6,7,8,9
     ],
-    "feat_info_path": "path/to/feat_info.json",
-    "float_feats": "path/to/float_feats.json",
+    "feat_info_path": "/home/wkai/projects/EHRFormer_paper/data/pretrain/feat_info.json",
+    "float_feats": "/home/wkai/projects/EHRFormer_paper/data/pretrain/float_feats.json",
     "ckpt_path": "path/to/ckpt for inference",
     "pred_folder": "pred"
 }

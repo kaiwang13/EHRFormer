@@ -1,388 +1,424 @@
-from collections import defaultdict
-from functools import partial
 from pathlib import Path
 import random
-from typing import Iterator, List, Optional
 import pytorch_lightning as pl
 import pandas as pd
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 import torch
-from torch.utils.data import DataLoader, default_collate, Sampler, BatchSampler
 import numpy as np
 import torch.nn.functional as F
 import pyarrow.parquet as pq
-import diskcache
-from transformers.trainer_pt_utils import LengthGroupedSampler, get_length_grouped_indices
+import pyarrow as pa
+import gc
+from Utils import json_load
 
-def save_parquet(df, path):
-    tmp_df = df.copy()
-    for col in tmp_df.columns:
-        if isinstance(tmp_df.iloc[0][col], np.ndarray) and len(tmp_df.iloc[0][col].shape) == 2:
-            tmp_df[col] = tmp_df[col].map(lambda x: list(x))
-    tmp_df.to_parquet(path)
-
-def load_parquet(path):
-    parquet_file = pq.ParquetFile(path)
-    tmp_df = []
-    for sub_df in parquet_file.iter_batches(batch_size=100000):
-        tmp_df.append(sub_df.to_pandas())
-    tmp_df = pd.concat(tmp_df, axis=0)
-    for col in tmp_df.columns:
-        if isinstance(tmp_df.iloc[0][col], np.ndarray) and isinstance(tmp_df.iloc[0][col][0], np.ndarray):
-            tmp_df[col] = tmp_df[col].map(lambda x: np.array(list(x)))
-    return tmp_df
-
-def sample_subset_2d(features, mask, prob):
-    M, N = features.shape
-    random_matrix = np.random.random(features.shape)
-    random_matrix[~mask] = float('inf')
-    valid_counts = np.sum(mask, axis=1, keepdims=True)
-    sample_counts = np.round(valid_counts * prob).astype(int)
-    sorted_indices = np.argsort(random_matrix, axis=1)
-    row_indices = np.arange(M)[:, np.newaxis]
-    col_positions = np.arange(N)[np.newaxis, :]
-    output_mask = np.zeros_like(mask, dtype=bool)
-    selection_matrix = col_positions < sample_counts
-    output_mask[row_indices, sorted_indices] = selection_matrix
-    output_mask = output_mask & mask
-    input_mask = mask & ~output_mask
+def optimize_dtypes(df):
+    for col in df.columns:
+        
+        if pd.api.types.is_integer_dtype(df[col]):
+            
+            col_min, col_max = df[col].min(), df[col].max()
+            
+            
+            if col_min >= 0:
+                if col_max < 2**8:
+                    df[col] = df[col].astype(np.uint8)
+                elif col_max < 2**16:
+                    df[col] = df[col].astype(np.uint16)
+                elif col_max < 2**32:
+                    df[col] = df[col].astype(np.uint32)
+            else:
+                if col_min > -2**7 and col_max < 2**7:
+                    df[col] = df[col].astype(np.int8)
+                elif col_min > -2**15 and col_max < 2**15:
+                    df[col] = df[col].astype(np.int16)
+                elif col_min > -2**31 and col_max < 2**31:
+                    df[col] = df[col].astype(np.int32)
+        
+        
+        elif pd.api.types.is_float_dtype(df[col]):
+            df[col] = df[col].astype(np.float32)  
+            
+        
+        elif pd.api.types.is_string_dtype(df[col]) and df[col].nunique() / len(df[col]) < 0.5:
+            df[col] = df[col].astype('category')
+            
+    return df
+def sample_subset(Mask, Prob):
+    num_true_in_Mask = np.sum(Mask)
+    num_samples = int(round(num_true_in_Mask * Prob))
+    valid_indices = np.where(Mask)[0]
     
-    
-    return input_mask, output_mask
+    if num_samples > 0 and len(valid_indices) > 0:
+        output_indices = np.random.choice(valid_indices, size=num_samples, replace=False)
+    else:
+        output_indices = valid_indices
+    input_indices = np.setdiff1d(valid_indices, output_indices)
+    return input_indices, output_indices
 
-def process_nested_dict(d, func):
-    result = {}
-    for key, value in d.items():
-        if isinstance(value, dict):
-            result[key] = process_nested_dict(value, func)
-        elif isinstance(value, torch.Tensor) or isinstance(value, np.ndarray):
-            result[key] = func(value)
+@dataclass
+class ChunkedEHRDataset(Dataset):
+    data_chunks: list  
+    mode: str
+    config: dict
+    def __post_init__(self):
+        self.mask_ratio = self.config['mask_ratio']
+        self.float_cols = sorted(json_load(self.config['float_feats']))
+        self.input_float_cols = [f'tokenized.{x}' for x in self.float_cols]
+        self.output_float_cols = self.float_cols
+        self.mean_std = np.array([(self.config['feat_info']['float_cols'][x]['mean'], self.config['feat_info']['float_cols'][x]['std']) for x in self.output_float_cols], dtype=np.float32)
+        self.cat_cols = [f'tokenized.{x}' for x in sorted(self.config['feat_info']['category_cols'])]
+        self.config['mean_std'] = self.mean_std
+        self.config['reg_label_names'] = self.float_cols
+        self.config['cls_label_names'] = sorted(self.config['feat_info']['category_cols'])
+        self.chunk_lengths = [len(chunk) for chunk in self.data_chunks]
+        self.cumulative_lengths = np.cumsum(self.chunk_lengths)
+        self.total_length = self.cumulative_lengths[-1] if self.chunk_lengths else 0
+    def read_sample(self, row):
+        sample = {
+            'cat_feats': torch.tensor(row[self.cat_cols].values.astype(np.int64), dtype=torch.long),
+            'float_feats': torch.tensor(row[self.input_float_cols].values.astype(np.int64), dtype=torch.long),
+        }
+        return sample
+    
+    def read_label(self, row):
+        float_feats = row[self.output_float_cols].values.astype(np.float32)
+        float_mask = (float_feats != -1) & ~np.isnan(float_feats)
+        float_feats = np.nan_to_num(float_feats, nan=-1.0)
+        float_feats = (float_feats - self.mean_std[:, 0]) / self.mean_std[:, 1]
+        cat_feats = np.nan_to_num(row[self.cat_cols].values, nan=-1)
+        cat_feats = cat_feats.astype(np.int64)
+        cat_mask = (cat_feats != -1)
+        cat_feats[~cat_mask] = 0
+        label = {
+            'cat_feats': torch.tensor(cat_feats, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(float_feats, dtype=torch.float32),
+            'float_valid_mask': torch.tensor(float_mask, dtype=torch.bool)
+        }
+        return label
+    def read_sample_label(self, row):
+        input_float_feats = row[self.input_float_cols].values.astype(np.int64)
+        float_mask = input_float_feats != -1
+        cat_feats = np.nan_to_num(row[self.cat_cols].values.astype(np.float32), nan=-1).astype(np.int64)
+        cat_mask = cat_feats != -1
+        if self.mask_ratio != 0 and self.mode != 'test':
+            
+            float_input_indices, float_output_indices = sample_subset(float_mask, self.mask_ratio)
+            
+            input_bool_array = np.zeros_like(float_mask, dtype=bool)
+            input_bool_array[float_input_indices] = True
+            input_values_array = np.zeros_like(input_float_feats) - 1
+            input_values_array[float_input_indices] = input_float_feats[float_input_indices]
+            
+            output_float_feats = row[self.output_float_cols].values.astype(np.float32)
+            output_float_feats = np.nan_to_num(output_float_feats, nan=-1.0)
+            output_float_feats = (output_float_feats - self.mean_std[:, 0]) / (self.mean_std[:, 1] + 1e-10)
+            
+            output_bool_array = np.zeros_like(float_mask, dtype=bool)
+            output_bool_array[float_output_indices] = True
+            output_values_array = np.zeros_like(output_float_feats)
+            output_values_array[float_output_indices] = output_float_feats[float_output_indices]
+            
+            valid_cat_indices = np.where(cat_mask)[0]
+            n_valid_cats = len(valid_cat_indices)
+            
+            if n_valid_cats > 0:
+                random_values = np.random.random(n_valid_cats)
+                output_selector = random_values < self.mask_ratio
+                cat_output_indices = valid_cat_indices[output_selector]
+                cat_input_indices = valid_cat_indices[~output_selector]
+            else:
+                cat_input_indices = np.array([], dtype=int)
+                cat_output_indices = np.array([], dtype=int)
+
+            input_cat_mask = np.zeros_like(cat_mask, dtype=bool)
+            input_cat_mask[cat_input_indices] = True
+            
+            output_cat_mask = np.zeros_like(cat_mask, dtype=bool)
+            output_cat_mask[cat_output_indices] = True
+            
+            
+            input_cat_values = np.zeros_like(cat_feats) - 1
+            input_cat_values[cat_input_indices] = cat_feats[cat_input_indices]
+            
+            output_cat_values = np.zeros_like(cat_feats)
+            output_cat_values[cat_output_indices] = cat_feats[cat_output_indices]
         else:
-            result[key] = value
-    return result
-
-
-def truncate(v, max_len):
-    return v[..., :max_len]
-
-def collate_fn(data):
-    batch = default_collate(data)
-    max_len = min(16, int(batch['length'].max()))
-    batch = process_nested_dict(batch, partial(truncate, max_len=max_len))
-    return batch
-
-class LengthBasedBatchSampler(Sampler):
-    def __init__(
-        self,
-        lengths: List[int],
-        batch_size: int,
-        shuffle: bool = True,
-        drop_last: bool = False
-    ):
-        self.lengths = lengths
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        
-        self.length_groups = defaultdict(list)
-        for idx, length in enumerate(lengths):
-            self.length_groups[length].append(idx)
-        
-        self.sorted_lengths = sorted(self.length_groups.keys())
-        
-    def __iter__(self) -> Iterator[List[int]]:
-        if self.shuffle:
-            for length in self.length_groups:
-                np.random.shuffle(self.length_groups[length])
-
-        length_iterators = {
-            length: iter(self.length_groups[length])
-            for length in self.sorted_lengths
+            
+            input_values_array = input_float_feats
+            output_values_array = row[self.output_float_cols].values.astype(np.float32)
+            output_values_array = np.nan_to_num(output_values_array, nan=-1.0)
+            output_values_array = (output_values_array - self.mean_std[:, 0]) / (self.mean_std[:, 1] + 1e-10)
+            
+            input_bool_array = float_mask
+            output_bool_array = float_mask
+            input_cat_values = cat_feats
+            input_cat_mask = cat_mask
+            output_cat_values = cat_feats
+            output_cat_mask = cat_mask
+        output_cat_values[output_cat_values == -1] = 0
+        sample = {
+            'cat_feats': torch.tensor(input_cat_values, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(input_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(input_values_array, dtype=torch.long),
+            'float_valid_mask': torch.tensor(input_bool_array, dtype=torch.bool)
         }
+        label = {
+            'cat_feats': torch.tensor(output_cat_values, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(output_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(output_values_array, dtype=torch.float32),
+            'float_valid_mask': torch.tensor(output_bool_array, dtype=torch.bool)
+        }
+        return sample, label
     
-        remaining_samples = {
-            length: len(indices)
-            for length, indices in self.length_groups.items()
+    def read_sample_label_old(self, row):
+        input_float_feats = row[self.input_float_cols].values.astype(np.int64)
+        float_mask = input_float_feats != -1
+        cat_feats = np.nan_to_num(row[self.cat_cols].values.astype(np.float32), nan=-1).astype(np.int64)
+        cat_mask = cat_feats != -1
+        if self.mask_ratio != 0:
+            input_indices, output_indices = sample_subset(float_mask, self.mask_ratio)
+            input_bool_array = np.zeros_like(float_mask, dtype=bool)
+            input_bool_array[input_indices] = True
+            input_values_array = np.zeros_like(input_float_feats)
+            input_values_array[input_indices] = input_float_feats[input_indices]
+            output_float_feats = row[self.output_float_cols].values.astype(np.float32)
+            output_float_feats = np.nan_to_num(output_float_feats, nan=-1.0)
+            output_float_feats = (output_float_feats - self.mean_std[:, 0]) / self.mean_std[:, 1]
+            output_bool_array = np.zeros_like(float_mask, dtype=bool)
+            output_bool_array[output_indices] = True
+            output_values_array = np.zeros_like(output_float_feats)
+            output_values_array[output_indices] = output_float_feats[output_indices]
+            
+            input_cat_mask = cat_mask & (np.random.randn(1) < self.mask_ratio)
+            input_cat = cat_feats if input_cat_mask[0] else np.ones_like(cat_feats) * -1
+            
+            output_cat_mask = cat_mask & ~input_cat_mask
+            output_cat = cat_feats if output_cat_mask[0] else np.zeros_like(cat_feats)
+        else:
+            input_values_array = input_float_feats
+            output_values_array = row[self.output_float_cols].values.astype(np.float32)
+            input_bool_array = float_mask
+            output_bool_array = float_mask
+            input_cat = cat_feats
+            input_cat_mask = cat_mask
+            output_cat = cat_feats
+            output_cat_mask = cat_mask
+        
+        sample = {
+            'cat_feats': torch.tensor(input_cat, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(input_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(input_values_array, dtype=torch.long),
+            'float_valid_mask': torch.tensor(input_bool_array, dtype=torch.bool)
         }
-        
-        batches = []
-        
-        for current_length in self.sorted_lengths:
-            while remaining_samples[current_length] > 0:
-                batch = []
-                while (
-                    remaining_samples[current_length] > 0 
-                    and len(batch) < self.batch_size
-                ):
-                    try:
-                        batch.append(next(length_iterators[current_length]))
-                        remaining_samples[current_length] -= 1
-                    except StopIteration:
-                        break
-                
-                if len(batch) < self.batch_size:
-                    next_length_idx = self.sorted_lengths.index(current_length) + 1
-                    while (
-                        len(batch) < self.batch_size 
-                        and next_length_idx < len(self.sorted_lengths)
-                    ):
-                        next_length = self.sorted_lengths[next_length_idx]
-                        while (
-                            remaining_samples[next_length] > 0 
-                            and len(batch) < self.batch_size
-                        ):
-                            try:
-                                batch.append(next(length_iterators[next_length]))
-                                remaining_samples[next_length] -= 1
-                            except StopIteration:
-                                break
-                        next_length_idx += 1
-                
-                if len(batch) == self.batch_size or (not self.drop_last and batch):
-                    batches.append(batch)
-
-        if self.shuffle:
-            np.random.shuffle(batches)
-            
-        return iter(batches)
-
-    def __len__(self) -> int:
-        total_samples = sum(len(indices) for indices in self.length_groups.values())
-        if self.drop_last:
-            return total_samples // self.batch_size
-        return (total_samples + self.batch_size - 1) // self.batch_size
-
-class DynamicLengthBasedBatchSampler(Sampler):
-    def __init__(
-        self,
-        lengths: List[int],
-        max_tokens_per_batch: int,  
-        shuffle: bool = True,
-        drop_last: bool = False,
-        min_batch_size: int = 1     
-    ):
-        self.lengths = lengths
-        self.max_tokens_per_batch = max_tokens_per_batch
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.min_batch_size = min_batch_size
-        
-        
-        self.length_groups = defaultdict(list)
-        for idx, length in enumerate(lengths):
-            self.length_groups[length].append(idx)
-        
-        self.sorted_lengths = sorted(self.length_groups.keys())
-        
-    def get_batch_size_for_length(self, length: int) -> int:
-        batch_size = self.max_tokens_per_batch // length
-        return max(min(batch_size, len(self.length_groups[length])), self.min_batch_size)
-    
-    def __iter__(self) -> Iterator[List[int]]:
-        if self.shuffle:
-            for length in self.length_groups:
-                np.random.shuffle(self.length_groups[length])
-        
-        length_iterators = {
-            length: iter(self.length_groups[length])
-            for length in self.sorted_lengths
+        label = {
+            'cat_feats': torch.tensor(output_cat, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(output_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(output_values_array, dtype=torch.float32),
+            'float_valid_mask': torch.tensor(output_bool_array, dtype=torch.bool)
         }
-        
-        remaining_samples = {
-            length: len(indices)
-            for length, indices in self.length_groups.items()
+        return sample, label
+    def __len__(self):
+        return self.total_length
+    def __getitem__(self, idx):
+        chunk_idx = np.searchsorted(self.cumulative_lengths, idx, side='right')
+        if chunk_idx > 0:
+            
+            within_chunk_idx = idx - self.cumulative_lengths[chunk_idx - 1]
+        else:
+            within_chunk_idx = idx
+        row = self.data_chunks[chunk_idx].iloc[within_chunk_idx]
+        sample, label = self.read_sample_label(row)
+        result = {
+            'pid': str(row['pid']),
+            'vid': str(row['vid']),
+            
+            'data': sample,
+            'label': label,
         }
-        
-        batches = []
-        
-        for current_length in self.sorted_lengths:
-            
-            current_batch_size = self.get_batch_size_for_length(current_length)
-            
-            while remaining_samples[current_length] > 0:
-                batch = []
-                
-                while (
-                    remaining_samples[current_length] > 0 
-                    and len(batch) < current_batch_size
-                ):
-                    try:
-                        batch.append(next(length_iterators[current_length]))
-                        remaining_samples[current_length] -= 1
-                    except StopIteration:
-                        break
-                
-                
-                if len(batch) < current_batch_size:
-                    next_length_idx = self.sorted_lengths.index(current_length) + 1
-                    while (
-                        len(batch) < current_batch_size 
-                        and next_length_idx < len(self.sorted_lengths)
-                    ):
-                        next_length = self.sorted_lengths[next_length_idx]
-                        
-                        max_additional = min(
-                            current_batch_size - len(batch),
-                            self.max_tokens_per_batch // next_length
-                        )
-                        while (
-                            remaining_samples[next_length] > 0 
-                            and len(batch) < current_batch_size
-                            and len(batch) < max_additional
-                        ):
-                            try:
-                                batch.append(next(length_iterators[next_length]))
-                                remaining_samples[next_length] -= 1
-                            except StopIteration:
-                                break
-                        next_length_idx += 1
-                
-                if len(batch) >= self.min_batch_size or (not self.drop_last and batch):
-                    batches.append(batch)
-        
-        if self.shuffle:
-            np.random.shuffle(batches)
-            
-        return iter(batches)
-
-    def __len__(self) -> int:
-        
-        total_tokens = sum(length * len(indices) for length, indices in self.length_groups.items())
-        if self.drop_last:
-            return total_tokens // self.max_tokens_per_batch
-        return (total_tokens + self.max_tokens_per_batch - 1) // self.max_tokens_per_batch
-    
+        return result
 
 @dataclass
 class EHRDataset(Dataset):
     data: pd.DataFrame
     mode: str
     config: dict
-
     def __post_init__(self):
-        self.lengths = self.data['n_visit'].values
-        self.train_length = self.config['train_length']
         self.mask_ratio = self.config['mask_ratio']
-        self.float_name_col = 'float_feat_cols'
-        self.input_float_col = 'tokenized_float_feats'
-        self.output_float_col = 'float_feats'
-        self.mean_std = np.array([(self.config['feat_info']['float_cols'][x]['mean'], self.config['feat_info']['float_cols'][x]['std']) for x in self.data.iloc[0][self.float_name_col]], dtype=np.float32)
-        self.cat_name_col = 'category_feat_cols'
-        self.input_cat_col = 'tokenized_category_feats'
-
-        self.df_path = self.config['df_path']
-        self.cache = diskcache.Cache(self.df_path, eviction_policy='none')
-        
-        self.config['reg_label_names'] = self.data.iloc[0][self.float_name_col]
+        self.float_cols = json_load(self.config['float_feats'])
+        self.input_float_cols = [f'tokenized.{x}' for x in self.float_cols]
+        self.output_float_cols = self.float_cols
+        self.mean_std = np.array([(self.config['feat_info']['float_cols'][x]['mean'], self.config['feat_info']['float_cols'][x]['std']) for x in self.output_float_cols], dtype=np.float32)
+        self.cat_cols = ['GENDER']
+        self.config['mean_std'] = self.mean_std
+        self.config['reg_label_names'] = self.float_cols
         self.config['cls_label_names'] = ['GENDER']
-
+    def read_sample(self, row):
+        sample = {
+            'cat_feats': torch.tensor(row[self.cat_cols].values.astype(np.int64), dtype=torch.long),
+            'float_feats': torch.tensor(row[self.input_float_cols].values.astype(np.int64), dtype=torch.long),
+        }
+        return sample
+    
+    def read_label(self, row):
+        float_feats = row[self.output_float_cols].values.astype(np.float32)
+        float_mask = (float_feats != -1) & ~np.isnan(float_feats)
+        float_feats = np.nan_to_num(float_feats, nan=-1.0)
+        float_feats = (float_feats - self.mean_std[:, 0]) / (self.mean_std[:, 1] + 1e-10)
+        cat_feats = np.nan_to_num(row[self.cat_cols].values, nan=-1)
+        cat_feats = cat_feats.astype(np.int64)
+        cat_mask = (cat_feats != -1)
+        cat_feats[~cat_mask] = 0
+        label = {
+            'cat_feats': torch.tensor(cat_feats, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(float_feats, dtype=torch.float32),
+            'float_valid_mask': torch.tensor(float_mask, dtype=torch.bool)
+        }
+        return label
+    
     def read_sample_label(self, row):
-        feats = self.cache[row['pid']]
-        tokenized_category_feats = feats['tokenized_category_feats']
-        tokenized_float_feats = feats['tokenized_float_feats']
-        float_feats = feats['float_feats']
-
-        input_float_feats = np.nan_to_num(tokenized_float_feats, nan=-1).astype(np.int64)
+        input_float_feats = row[self.input_float_cols].values.astype(np.int64)
         float_mask = input_float_feats != -1
-        output_float_feats = np.nan_to_num(float_feats, nan=-1.0).astype(np.float32)
-
-        input_cat_feats = np.nan_to_num(tokenized_category_feats, nan=-1).astype(np.int64)
-        output_cat_feats = np.nan_to_num(tokenized_category_feats, nan=0).astype(np.int64)
-        output_cat_feats[output_cat_feats == -1] = 0
-        cat_mask = input_cat_feats != -1
-
-        time_index = row['time_index'].astype(np.int64)
-        valid_mask = row['valid_mask'].astype(bool)
-
+        cat_feats = np.nan_to_num(row[self.cat_cols].values.astype(np.float32), nan=-1).astype(np.int64)
+        cat_mask = cat_feats != -1
         if self.mask_ratio != 0:
-            input_mask, output_mask = sample_subset_2d(input_float_feats, float_mask, self.mask_ratio)
-            input_sample = np.where(input_mask, input_float_feats, -1)
-            output_sample = np.where(output_mask, output_float_feats, -1.0)
-            output_sample = (output_sample - self.mean_std[:, 0][:, np.newaxis]) / self.mean_std[:, 1][:, np.newaxis]
+            input_indices, output_indices = sample_subset(float_mask, self.mask_ratio)
+            input_bool_array = np.zeros_like(float_mask, dtype=bool)
+            input_bool_array[input_indices] = True
+            input_values_array = np.zeros_like(input_float_feats)
+            input_values_array[input_indices] = input_float_feats[input_indices]
+            output_float_feats = row[self.output_float_cols].values.astype(np.float32)
+            output_float_feats = np.nan_to_num(output_float_feats, nan=-1.0)
+            output_float_feats = (output_float_feats - self.mean_std[:, 0]) / self.mean_std[:, 1]
+            output_bool_array = np.zeros_like(float_mask, dtype=bool)
+            output_bool_array[output_indices] = True
+            output_values_array = np.zeros_like(output_float_feats)
+            output_values_array[output_indices] = output_float_feats[output_indices]
+            
+            input_cat_mask = cat_mask & (np.random.randn(1) < self.mask_ratio)
+            input_cat = cat_feats if input_cat_mask[0] else np.ones_like(cat_feats) * -1
+            
+            output_cat_mask = cat_mask & ~input_cat_mask
+            output_cat = cat_feats if output_cat_mask[0] else np.zeros_like(cat_feats)
+        else:
+            input_values_array = input_float_feats
+            output_values_array = row[self.output_float_cols].values.astype(np.float32)
+            input_bool_array = float_mask
+            output_bool_array = float_mask
+            input_cat = cat_feats
+            input_cat_mask = cat_mask
+            output_cat = cat_feats
+            output_cat_mask = cat_mask
         
         sample = {
-            'time_index': time_index,
-            'valid_mask': valid_mask,
-            'cat_feats': input_cat_feats,
-            'float_feats': input_sample,
-            'float_valid_mask': input_mask
+            'cat_feats': torch.tensor(input_cat, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(input_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(input_values_array, dtype=torch.long),
+            'float_valid_mask': torch.tensor(input_bool_array, dtype=torch.bool)
         }
         label = {
-            'cat_feats': output_cat_feats,
-            'cat_valid_mask': cat_mask,
-            'float_feats': output_sample,
-            'float_valid_mask': output_mask
+            'cat_feats': torch.tensor(output_cat, dtype=torch.long),
+            'cat_valid_mask': torch.tensor(output_cat_mask, dtype=torch.bool),
+            'float_feats': torch.tensor(output_values_array, dtype=torch.float32),
+            'float_valid_mask': torch.tensor(output_bool_array, dtype=torch.bool)
         }
         return sample, label
-
     def __len__(self):
         return len(self.data)
-
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         sample, label = self.read_sample_label(row)
         result = {
-            'pid': row['pid'],
-            'length': min(16, row['n_visit']),
+            'pid': str(row['PATIENT_SN']),
+            'vid': str(row['VISIT_SN']),
             'data': sample,
             'label': label,
         }
-        result = process_nested_dict(result, partial(truncate, max_len=self.train_length))
         return result
     
 class EHRDataModule(pl.LightningDataModule):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.train_length = self.config['train_length']
         self.df_path = config.get('df_path', None)
         self.use_cache = config.get('use_cache', False)
-
         self.dataset_col = config.get('dataset_col', None)
         self.batch_size = config.get('batch_size', None)
         self.train_folds = config.get('train_folds', None)
         self.valid_folds = config.get('valid_folds', None)
         self.test_folds = config.get('test_folds', None)
+        self.float_cols = json_load(config['float_feats'])
+        self.input_float_cols = [f'tokenized.{x}' for x in self.float_cols]
+        self.cat_cols = [f'tokenized.{x}' for x in sorted(self.config['feat_info']['category_cols'])]
+        
+        self.needed_columns = ['pid', 'vid', self.dataset_col] + self.cat_cols + self.float_cols + self.input_float_cols
+        self.chunk_size = config.get('chunk_size', 1000000)  
         
     def setup(self, stage=None):
         if isinstance(self.df_path, pd.DataFrame):
             df = self.df_path
-        else:
+            df = optimize_dtypes(df)
+            df_train = df[df[self.dataset_col].isin(self.train_folds)].reset_index(drop=True)
+            df_valid = df[df[self.dataset_col].isin(self.valid_folds)].reset_index(drop=True)
+            df_test = df[df[self.dataset_col].isin(self.test_folds)].reset_index(drop=True)
             
-            df = pd.read_parquet(Path(self.df_path) / 'metadata.parquet')
-        df = df[df['n_visit'] != 1]
-        df_train = df[df[self.dataset_col].isin(self.train_folds)].reset_index(drop=True)
-        df_valid = df[df[self.dataset_col].isin(self.valid_folds)].reset_index(drop=True)
-        self.ds_train = EHRDataset(df_train, 'train', self.config)
-        self.ds_valid = EHRDataset(df_valid, 'valid', self.config)
-
-        if self.config.get('test_df', '') != '':
-            df_test = pd.read_csv(self.config['test_df'])
+            self.ds_train = EHRDataset(df_train, 'train', self.config)
+            self.ds_valid = EHRDataset(df_valid, 'valid', self.config)
+            self.ds_test = EHRDataset(df_test, 'test', self.config)
         else:
-            df_test = df[df[self.dataset_col].isin(self.test_folds)]
-        self.ds_test = EHRDataset(df_test, 'test', self.config)
-        
+            parquet_file = pq.ParquetFile(Path(self.df_path))
+            df_train_chunks = []
+            df_valid_chunks = []
+            df_test_chunks = []
+            dataset_col_table = pq.read_table(self.df_path, columns=[self.dataset_col])
+            dataset_values = dataset_col_table.to_pandas()[self.dataset_col]
+            train_mask = dataset_values.isin(self.train_folds)
+            valid_mask = dataset_values.isin(self.valid_folds)
+            test_mask = dataset_values.isin(self.test_folds)
+            train_indices = train_mask[train_mask].index.tolist()
+            valid_indices = valid_mask[valid_mask].index.tolist()
+            test_indices = test_mask[test_mask].index.tolist()
+            
+            del dataset_col_table, dataset_values, train_mask, valid_mask, test_mask
+            gc.collect()
+            
+            for batch in parquet_file.iter_batches(batch_size=self.chunk_size, columns=self.needed_columns):
+                chunk_df = optimize_dtypes(batch.to_pandas())
+                start_idx = len(df_train_chunks) * self.chunk_size
+                end_idx = start_idx + len(chunk_df)
+                chunk_train_indices = [i for i in train_indices if start_idx <= i < end_idx]
+                chunk_valid_indices = [i for i in valid_indices if start_idx <= i < end_idx]
+                chunk_test_indices = [i for i in test_indices if start_idx <= i < end_idx]
+                chunk_train_indices = [i - start_idx for i in chunk_train_indices]
+                chunk_valid_indices = [i - start_idx for i in chunk_valid_indices]
+                chunk_test_indices = [i - start_idx for i in chunk_test_indices]
+                if chunk_train_indices:
+                    df_train_chunks.append(chunk_df.iloc[chunk_train_indices].reset_index(drop=True))
+                if chunk_valid_indices:
+                    df_valid_chunks.append(chunk_df.iloc[chunk_valid_indices].reset_index(drop=True))
+                if chunk_test_indices:
+                    df_test_chunks.append(chunk_df.iloc[chunk_test_indices].reset_index(drop=True))
+                del chunk_df
+                gc.collect()
+            self.ds_train = ChunkedEHRDataset(df_train_chunks, 'train', self.config)
+            self.ds_valid = ChunkedEHRDataset(df_valid_chunks, 'valid', self.config)
+            
+            if self.config.get('test_df', '') != '':
+                df_test = pd.read_csv(self.config['test_df'])
+                df_test = optimize_dtypes(df_test)
+                self.ds_test = EHRDataset(df_test, 'test', self.config)
+            else:
+                self.ds_test = ChunkedEHRDataset(df_test_chunks, 'test', self.config)
     def train_dataloader(self):
-        sampler = LengthBasedBatchSampler(batch_size=self.batch_size, lengths=self.ds_train.lengths)
-        
-        return DataLoader(self.ds_train, num_workers=8,
-                          batch_sampler=sampler,
-                          collate_fn=collate_fn,
-                          pin_memory=False)
-
+        return DataLoader(self.ds_train, batch_size=self.batch_size, num_workers=8, 
+                          pin_memory=True, shuffle=True)
     def val_dataloader(self):
-        sampler = LengthBasedBatchSampler(batch_size=self.batch_size, lengths=self.ds_valid.lengths)
-        
-        return DataLoader(self.ds_valid, num_workers=8,
-                          batch_sampler=sampler,
-                          collate_fn=collate_fn,
-                          pin_memory=False)
-
+        return DataLoader(self.ds_valid, batch_size=self.batch_size, num_workers=8, 
+                          pin_memory=True, shuffle=False)
     def test_dataloader(self):
         return DataLoader(self.ds_test, batch_size=self.batch_size, num_workers=8,
-                        
-                          pin_memory=False, shuffle=False)
-
+                          pin_memory=True, shuffle=False)
     def teardown(self, stage=None):
-        pass
+        gc.collect()

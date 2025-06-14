@@ -1,14 +1,12 @@
 {
-    "debug": false,
+    "debug": true,
     "project": "ehrformer-finetune",
-    "stage": "pretrain",
-    "name": "ehrformer",
-    "model": "ehrformer",
+    "stage": "finetune",
     "output_dir": "output/finetune",
     "n_gpus": [
-        0,1,2,3,4,5,6,7
+        7
     ],
-    "n_epoch": 300,
+    "n_epoch": 100,
     "train": true,
     "test": false,
     "lr": 0.0001,
@@ -16,14 +14,14 @@
     "output_dim": 768,
     "proj_dim": 256,
     "n_category_feats": 1,
-    "n_float_feats": 286,
+    "n_float_feats": 4,
     "n_category_values": 2,
     "n_float_values": 256,
     "seq_max_len": 16,
-    "df_path": "path/to/dataframe",
-    "use_cache": false,
+    "df_paths": "/dev/shm/cache/0615/sample",
+    "use_cache": true,
     "dataset_col": "dataset_fold10",
-    "batch_size": 768,
+    "batch_size": 200,
     "train_folds": [
         1,
         2,
@@ -39,7 +37,7 @@
         0
     ],
     "test_folds": [
-        0,1,2,3,4,5,6,7,8,9
+        0
     ],
     "cls_label_cols": ["c_cls_labels", "f_cls_labels"],
     "cls_label_name_cols": ["diag_cols", "diag_cols"],

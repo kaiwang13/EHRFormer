@@ -2,7 +2,9 @@ import torch.nn as nn
 import torch
 from einops import rearrange
 from transformers import BertConfig
-from flash_attn.models.bert import BertEncoder, BertModel
+from transformers import GPT2Model, BertModel
+from transformers.models.bert.modeling_bert import BertEncoder
+# from flash_attn.models.bert import BertEncoder, BertModel
 
 class GradientReversalFunction(torch.autograd.Function):
     @staticmethod
@@ -38,32 +40,6 @@ class DomainDiscriminator(nn.Module):
         x = self.grl(x)
         x = self.fc(x)
         return x
-        
-class MultiTaskHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.output_dim = config['output_dim']
-        self.proj_dim = config['proj_dim']
-
-        self.cls_fc = nn.Sequential(
-            nn.Linear(self.output_dim, self.proj_dim),
-            nn.ReLU(),
-            nn.Linear(self.proj_dim, 2)
-        )
-        self.reg_fc = nn.Sequential(
-            nn.Linear(self.output_dim, self.proj_dim),
-            nn.ReLU(),
-            nn.Linear(self.proj_dim, 1)
-        )
-
-    def forward(self, h_cls, h_reg):
-        
-        
-        y_cls = self.cls_fc(h_cls)
-        y_reg = self.reg_fc(h_reg).squeeze(2)
-        return y_cls, y_reg
-
 
 class EHREmbedding2D(nn.Module):
     def __init__(self, config):
@@ -107,7 +83,6 @@ class EHREmbedding2D(nn.Module):
             ft_emb = rearrange(ft_emb, '(b l) n d -> b l n d', b=B)
 
         return ft_emb  
-
 
 class EHRVAE2D(nn.Module):
     def __init__(self, config):
@@ -170,7 +145,33 @@ class EHRVAE2D(nn.Module):
     def forward_mu(self, cat_feats, float_feats):
         mu_z = self.ehr_mu(cat_feats, float_feats)
         return mu_z
-    
+
+class MultiTaskHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.output_dim = config['output_dim']
+        self.proj_dim = config['proj_dim']
+
+        self.cls_fc = nn.Sequential(
+            nn.Linear(self.output_dim, self.proj_dim),
+            nn.ReLU(),
+            nn.Linear(self.proj_dim, 2)
+        )
+        self.reg_fc = nn.Sequential(
+            nn.Linear(self.output_dim, self.proj_dim),
+            nn.ReLU(),
+            nn.Linear(self.proj_dim, 1)
+        )
+
+    def forward(self, h_cls, h_reg):
+        # h_cls = h[:, :self.n_cls, :]
+        # h_reg = h[:, self.n_cls:, :]
+        y_cls = self.cls_fc(h_cls)
+        y_reg = self.reg_fc(h_reg).squeeze(2)
+        return y_cls, y_reg
+
+
 class EHREmbedding1D(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -187,11 +188,13 @@ class EHREmbedding1D(nn.Module):
         self.pool_emb = self.config['pool_emb']
         self.bert = BertModel(self.config['BERT_config'])
 
-    def forward(self, cat_feats, float_feats):  
+    def forward(self, cat_feats, float_feats):  # cat_feats: (b, nc), float_feats: (b, nf)
         B = cat_feats.shape[0]
 
         cat_feats_mask = cat_feats == -1
         float_feats_mask = float_feats == -1
+
+        # attention_mask = torch.cat([self.one.unsqueeze(0).expand(B, -1), ~cat_feats_mask, ~float_feats_mask], dim=1)
 
         cat_feats = cat_feats + 2
         cat_feats[cat_feats_mask] = 1
@@ -202,13 +205,14 @@ class EHREmbedding1D(nn.Module):
         token_type_ids = self.token_type_ids.unsqueeze(0).expand(B, -1)
         ft_emb = self.bert(
             input_ids=input_ids,
+            # attention_mask=attention_mask,
             token_type_ids=token_type_ids
         )
         if self.pool_emb:
             ft_emb = ft_emb.pooler_output
         else:
             ft_emb = ft_emb.last_hidden_state
-        return ft_emb  
+        return ft_emb  # time_index: (b, d)
     
 class EHRVAE1D(nn.Module):
     def __init__(self, config):
@@ -218,7 +222,7 @@ class EHRVAE1D(nn.Module):
         self.n_reg = len(self.config['reg_label_names'])
 
         self.config['BERT_config'] = BertConfig(
-            vocab_size=config['n_category_values']+config['n_float_values']+2,  
+            vocab_size=config['n_category_values']+config['n_float_values']+2,  # 1 for padding, 0 for CLS
             hidden_size=config['output_dim'],
             num_hidden_layers=2,
             num_attention_heads=12,
@@ -227,14 +231,15 @@ class EHRVAE1D(nn.Module):
             hidden_dropout_prob=0.1,
             attention_probs_dropout_prob=0.1,
             max_position_embeddings=512,
-            type_vocab_size=config['n_category_feats']+config['n_float_feats']+1,  
+            type_vocab_size=config['n_category_feats']+config['n_float_feats']+1,  # 0 for CLS
             initializer_range=0.02,
             layer_norm_eps=1e-12,
             pad_token_id=1,
             position_embedding_type="none",
             use_cache=True,
             classifier_dropout=None,
-            use_flash_attn=True,
+            
+            # use_flash_attn=True,
         )
         self.ehr_layer = EHREmbedding1D(config)
         self.ehr_mu = BertEncoder(self.config['BERT_config'])
@@ -249,27 +254,24 @@ class EHRVAE1D(nn.Module):
 
     def forward(self, cat_feats, float_feats):
         feat = self.ehr_layer(cat_feats, float_feats)
-        
-        
-        mu_z = self.ehr_mu(feat)
-        std_z = self.ehr_std(feat)
+        mu_z = self.ehr_mu(feat).last_hidden_state
+        std_z = self.ehr_std(feat).last_hidden_state
+        # mu_z = self.ehr_mu(feat)
+        # std_z = self.ehr_std(feat)
         z = self.reparameterize(mu_z, std_z)
-        
-        h = self.decoder(z) 
+        h = self.decoder(z).last_hidden_state # B, Nc+Nf, D
+        # h = self.decoder(z) # B, Nc+Nf, D
         h = h[:, 1:, :]
         h_cls = h[:, :self.n_cls, :]
         h_reg = h[:, self.n_cls:, :]
         y_cls, y_reg = self.head(h_cls, h_reg)
-        
-        domain_output = self.discriminator(h)
-        return y_cls, y_reg, mu_z, std_z, domain_output
+        return y_cls, y_reg, mu_z, std_z
     
     def forward_mu(self, cat_feats, float_feats):
         mu_z = self.ehr_mu(cat_feats, float_feats)
         return mu_z
     
-
-class MultiTaskHead(nn.Module):
+class MultiTaskHead2(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -323,7 +325,7 @@ class EHREmbedding(nn.Module):
             use_cache=True,
             classifier_dropout=None,
 
-            use_flash_attn=True
+            # use_flash_attn=True
         ))
 
     def forward(self, cat_feats, float_feats):  # cat_feats: (b, nc, l), float_feats: (b, nf, l)
@@ -358,7 +360,7 @@ class EHRFormer(nn.Module):
         self.config = config 
         self.ehr_embed = EHREmbedding(config)
         self.transformer = GPT2Model(config['transformer'])
-        self.head = MultiTaskHead(config)
+        self.head = MultiTaskHead2(config)
 
     def forward(self, cat_feats, float_feats, valid_mask, time_index):
         B = cat_feats.shape[0]

@@ -34,13 +34,13 @@ Key features:
 
 1. Clone the repository:
    ```bash
-   git clone <your_repo_url>
+   git clone <EHRFormer_url>
    cd EHRFormer
    ```
 
 2. Install dependencies (Python 3.8+ recommended):
    ```bash
-   pip install torch pytorch-lightning transformers scikit-learn pandas numpy tqdm matplotlib opencv-python pillow wandb
+   pip install torch pytorch-lightning transformers scikit-learn pandas numpy tqdm matplotlib opencv-python pillow wandb diskcache
    ```
 
    Additional dependencies may be required depending on your environment and GPU setup.
@@ -48,6 +48,7 @@ Key features:
 ## Data Preparation
 
 - Prepare your EHR data as a DataFrame and feature information JSON files.
+- 2 generated example dataframes (n=1000) are provided for pretraining and finetuning step, respectively.
 - Update the configuration files in `configs/` (e.g., `pretrain.json`, `finetune.json`) with the correct paths:
   - `"df_path"`: Path to your EHR DataFrame.
   - `"feat_info_path"`: Path to the feature info JSON.
@@ -62,7 +63,7 @@ To pretrain the EHRFormer model on your EHR data:
 python pretrain.py
 ```
 
-- The script uses the configuration in `configs/train.json` by default.
+- The script uses the configuration in `configs/pretrain.json` by default.
 - Adjust GPU settings, epochs, and data paths in the config as needed.
 
 ## Finetuning
@@ -78,44 +79,7 @@ python finetune.py
 
 ## Configuration
 
-Configuration files are in JSON format and control all aspects of training and evaluation. Example (`configs/train.json`):
-
-```json
-{
-    "debug": false,
-    "project": "ehrformer-pretrain",
-    "stage": "pretrain",
-    "name": "ehrformer",
-    "model": "ehrformer",
-    "output_dir": "output/pretrain",
-    "n_gpus": [0,1,2,3,4,5,6,7],
-    "n_epoch": 300,
-    "train": true,
-    "test": false,
-    "lr": 0.0001,
-    "wd": 0.05,
-    "output_dim": 768,
-    "proj_dim": 768,
-    "n_category_feats": 28,
-    "n_float_feats": 150,
-    "n_category_values": 2,
-    "n_float_values": 256,
-    "mask_ratio": 0.5,
-    "pool_emb": false,
-    "df_path": "path/to/dataframe",
-    "train_length": 1,
-    "use_cache": false,
-    "dataset_col": "dataset_fold10",
-    "batch_size": 768,
-    "train_folds": [1,2,3,4,5,6,7,8,9],
-    "valid_folds": [0],
-    "test_folds": [0,1,2,3,4,5,6,7,8,9],
-    "feat_info_path": "path/to/feat_info.json",
-    "float_feats": "path/to/float_feats.json",
-    "ckpt_path": "path/to/ckpt for inference",
-    "pred_folder": "pred"
-}
-```
+Configuration files are in JSON format and control all aspects of training and evaluation.
 
 ## Logging & Checkpoints
 
