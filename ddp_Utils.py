@@ -1,3 +1,4 @@
+"""Distributed Data Parallel utilities for multi-GPU training."""
 import os
 import torch
 import torch.distributed as dist
@@ -7,6 +8,7 @@ import diffdist.functional as DF
 
 
 def all_gather(tensors):
+    """Gather tensors from all processes and concatenate."""
     gather_list = []
     output_tensor = []
     world_size = dist.get_world_size()
@@ -22,6 +24,7 @@ def all_gather(tensors):
 
 
 def all_gather2(tensors):
+    """Gather tensors from all processes without concatenation."""
     gather_list = []
     world_size = dist.get_world_size()
     for tensor in tensors:
@@ -34,6 +37,7 @@ def all_gather2(tensors):
 
 
 def all_gather_grad(tensors):
+    """Gather tensors with gradient support."""
     gather_list = []
     output_tensor = []
     world_size = dist.get_world_size()
@@ -49,6 +53,7 @@ def all_gather_grad(tensors):
 
 
 def all_gather_grad2(tensors):
+    """Gather tensors with gradient support, no concatenation."""
     gather_list = []
     world_size = dist.get_world_size()
     for tensor in tensors:
@@ -61,6 +66,7 @@ def all_gather_grad2(tensors):
 
 
 def all_reduce(tensors, average=True):
+    """All-reduce tensors across processes."""
     for tensor in tensors:
         dist.all_reduce(tensor, async_op=False)
     if average:
@@ -71,11 +77,13 @@ def all_reduce(tensors, average=True):
 
 
 def setup(rank, world_size, port='12345'):
+    """Initialize distributed training process group."""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = port
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     
 def cleanup():
+    """Clean up distributed training."""
     dist.destroy_process_group()
     

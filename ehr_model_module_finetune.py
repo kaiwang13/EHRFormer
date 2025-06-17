@@ -1,3 +1,4 @@
+"""EHRFormer finetuning module for downstream tasks."""
 from collections import defaultdict
 from functools import reduce
 from pathlib import Path
@@ -12,7 +13,7 @@ from torchmetrics.utilities.data import dim_zero_cat
 import torch
 import torchmetrics.functional as MF
 from tqdm import tqdm
-from Utils_ehr import save_parquet
+from Utils import save_parquet
 from ddp_Utils import *
 import numpy as np
 from cosine_annealing_warmup import CosineAnnealingWarmupRestarts

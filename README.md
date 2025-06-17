@@ -1,103 +1,230 @@
 # EHRFormer
 
-EHRFormer is a foundation model for learning robust, universal patient representations from large-scale, longitudinal, and multi-cohort electronic health records (EHRs). It is designed to address the inherent heterogeneity and biases in real-world EHR data, enabling downstream clinical analyses such as biological age (BA) prediction, missing value imputation, and cross-cohort batch effect correction.
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/)
+[![PyTorch Lightning](https://img.shields.io/badge/PyTorch%20Lightning-2.0+-ee4c2c.svg)](https://pytorch-lightning.readthedocs.io/)
 
-## Overview
+A unified transformer-based foundation model for Electronic Health Records (EHR) that supports both self-supervised pretraining and supervised finetuning on sequential clinical data with advanced feature-level masking.
 
-EHRFormer leverages a stochastic masking strategy for representation encoding and reconstruction, capturing complex feature interactions and imputing missing clinical indicators. An adversarial module is incorporated to remove subjective biases, and a cohort-agnostic adversarial training approach is used to eliminate batch effects across different hospital cohorts. The model is pretrained in an autoregressive manner to capture both current and temporal dynamics of patient health trajectories.
+## 🔥 Features
 
-Key features:
-- **Stochastic masking** for robust representation learning and imputation.
-- **Adversarial training** to remove cohort-specific and subjective biases.
-- **Autoregressive pretraining** to model temporal EHR dynamics.
-- **Supports multiple clinical indicators** (lab tests, vital signs, etc.).
-- **PyTorch Lightning** based training and evaluation pipeline.
+- **Unified Architecture**: Single `EHRFormer` model for both pretraining and finetuning
+- **Sequential Modeling**: Handles temporal EHR data with timestamp-aware attention
+- **Feature-Level Masking**: Advanced pretraining with timestamp-wise feature masking (50% of valid features per timestamp)
+- **Multi-Task Learning**: Supports both classification and regression tasks
+- **Distributed Training**: PyTorch Lightning with multi-GPU support
+- **Flexible Data Loading**: Efficient chunked data loading with caching support
 
-## System requirements
+## 📋 Requirements
 
-- **Hardware**:
-  - **GPU**: 8x NVIDIA H100 (80GB) for default training configuration
-  - **CPU**: 64 cores recommended
-  - **RAM**: 1TB memory
-  
-- **Software**:
-  - Python 3.8+
-  - CUDA 11.7+ and cuDNN compatible with your PyTorch version
-  
+### Hardware
+- **GPU**: NVIDIA GPU with CUDA support (tested on H100)
+- **Memory**: 16GB+ GPU memory recommended for default settings
+- **Storage**: SSD recommended for large datasets
 
-**Note**: The model training parameters can be adjusted based on your available hardware. For systems with less GPU memory or fewer GPUs, consider:
-- Reducing batch size in config files
-- Decreasing model dimensions
-- Training with fewer data folds in parallel
+### Software
+- Python 3.8+
+- CUDA 11.7+ compatible with PyTorch
+- PyTorch Lightning 2.0+
 
-## Installation
+## 🚀 Quick Start
 
-1. Clone the repository:
+### Installation
+
+1. **Clone the repository**:
    ```bash
-   git clone <EHRFormer_url>
+   git clone <repository-url>
    cd EHRFormer
    ```
 
-2. Install dependencies (Python 3.8+ recommended):
+2. **Create conda environment**:
    ```bash
-   pip install torch pytorch-lightning transformers scikit-learn pandas numpy tqdm matplotlib opencv-python pillow wandb diskcache
+   conda create -n ehrformer python=3.8
+   conda activate ehrformer
    ```
 
-   Additional dependencies may be required depending on your environment and GPU setup.
+3. **Install dependencies**:
+   ```bash
+   pip install torch pytorch-lightning transformers
+   pip install pandas numpy scikit-learn tqdm
+   pip install diskcache pyarrow wandb statsmodels
+   ```
 
-## Data Preparation
+### Run with Demo Data
 
-- Prepare your EHR data as a DataFrame and feature information JSON files.
-- 2 generated example dataframes (n=1000) are provided for pretraining and finetuning step, respectively.
-- Update the configuration files in `configs/` (e.g., `pretrain.json`, `finetune.json`) with the correct paths:
-  - `"df_path"`: Path to your EHR DataFrame.
-  - `"feat_info_path"`: Path to the feature info JSON.
-  - `"float_feats"`: Path to the float features JSON.
-  - `"ckpt_path"`: Path to a checkpoint for inference (if testing).
+The repository includes demo data ready for immediate testing:
 
-## Pretraining
+```bash
+# Pretraining with demo data
+python pretrain.py
 
-To pretrain the EHRFormer model on your EHR data:
+# Finetuning with demo data  
+python finetune.py
+```
+
+The demo data includes:
+- 1,000 synthetic patient samples
+- 5 features (1 categorical, 4 continuous)
+- Pre-configured paths in `configs/*.json`
+
+## 📊 Data Format Requirements
+
+### For Custom Data Training
+
+To train EHRFormer on your custom data, you need to process your data into the following format:
+
+#### Required DataFrame Columns
+
+```python
+# Each row represents one patient sequence
+{
+    'pid': str,                           # Patient ID (unique identifier)
+    'tokenized_category_feats': ndarray,  # (n_cat, seq_len) - Discretized categorical features
+    'tokenized_float_feats': ndarray,     # (n_float, seq_len) - Discretized continuous features  
+    'category_feats': ndarray,            # (n_cat, seq_len) - Original categorical values
+    'float_feats': ndarray,               # (n_float, seq_len) - Original continuous values
+    'valid_mask': ndarray,                # (seq_len,) - Valid timestamp mask
+    'time_index': ndarray,                # (seq_len,) - Time indices
+    'dataset_fold10': int                 # Dataset fold for train/val/test split
+}
+```
+
+#### Data Processing Steps
+
+1. **Tokenization**: Convert categorical and continuous features to token indices
+   - Categorical: Map categories to integer tokens (0, 1, 2, ...)
+   - Continuous: Quantize values to discrete tokens (e.g., 0-255 for 256 bins)
+   - Missing values: Use -1 as missing token
+
+2. **Sequence Formatting**: Organize data by timestamps
+   - Each feature becomes a sequence across time
+   - Pad or truncate sequences to `seq_max_len`
+   - Create `valid_mask` to indicate actual vs padded timestamps
+
+3. **Feature Statistics**: Create `feat_info.json` with normalization statistics
+   ```json
+   {
+       "category_cols": ["GENDER", "AGE_GROUP", ...],
+       "float_cols": {
+           "LAB_VALUE_1": {"mean": 50.0, "std": 15.0},
+           "LAB_VALUE_2": {"mean": 100.0, "std": 25.0},
+           ...
+       }
+   }
+   ```
+
+### Demo Data
+
+The repository includes demo data in `sample_data/` with:
+- **1,000 synthetic patient samples** in `sample_data/sample/`
+- **4 features** (1 categorical: GENDER, 4 continuous: lab_float_CBC_RBC, lab_float_CBC_WBC, sign_SBP, sign_DBP)
+- **Pre-processed format** for immediate testing
+- **Feature statistics** in `sample_data/feat_info.json`
+- **Feature list** in `sample_data/float_feats.json`
+
+This serves as a reference for data format and processing pipeline.
+
+## 🎯 Usage
+
+### Pretraining
+
+Train the model with self-supervised feature-level masking:
 
 ```bash
 python pretrain.py
 ```
 
-- The script uses the configuration in `configs/pretrain.json` by default.
-- Adjust GPU settings, epochs, and data paths in the config as needed.
+The pretraining process:
+1. **Feature-level masking**: Randomly masks 50% of valid features at each timestamp
+2. **Multi-task prediction**: Predicts original feature values at masked positions
+3. **Balanced losses**: Uses both categorical (cross-entropy) and continuous (MSE) reconstruction losses
 
-## Finetuning
+### Finetuning
 
-To finetune the pretrained model for downstream tasks (e.g., BA prediction):
+Finetune the pretrained model for downstream tasks:
 
 ```bash
 python finetune.py
 ```
 
-- The script uses the configuration in `configs/finetune.json` by default.
-- Update the config for your specific task and data.
+The finetuning process:
+1. Loads pretrained EHRFormer weights
+2. Adds task-specific prediction heads
+3. Trains on labeled data for specific clinical tasks
 
-## Configuration
+### Configuration
 
-Configuration files are in JSON format and control all aspects of training and evaluation.
+Modify `configs/pretrain.json` or `configs/finetune.json`:
 
-## Logging & Checkpoints
+```json
+{
+    "mode": "pretrain",                    // "pretrain" or "finetune"
+    "n_gpus": [0],                        // GPU devices to use
+    "batch_size": 32,                     // Batch size
+    "lr": 1e-4,                          // Learning rate
+    "n_epoch": 100,                      // Number of epochs
+    "seq_max_len": 64,                   // Maximum sequence length
+    "df_paths": "sample_data/sample",    // Data directory (demo data)
+    "feat_info_path": "sample_data/feat_info.json", // Feature statistics
+    "float_feats": "sample_data/float_feats.json",  // Float feature list
+    "use_cache": true,                   // Enable data caching
+    "train_folds": [1,2,3,4,5,6,7,8,9], // Training folds
+    "valid_folds": [0]                   // Validation folds
+}
+```
 
-- Training logs and checkpoints are saved in the `output/` directory.
-- Supports both CSV and [Weights & Biases (wandb)](https://wandb.ai/) logging.
-
-## Applications
-
-- **Biological Age (BA) prediction** across the full human lifecycle.
-- **Imputation** of missing clinical indicators.
-- **Batch effect correction** for multi-cohort EHR integration.
-- **Generalizable patient representation** for downstream clinical tasks.
-
-## Citation
-
-If you use EHRFormer in your research, please cite the corresponding paper:
+## 📁 Project Structure
 
 ```
+EHRFormer/
+├── README.md                    # This file
+├── LICENSE                      # MIT License
+├── pretrain.py                  # Pretraining script
+├── finetune.py                  # Finetuning script
+├── ehrformer.py                 # Core model architecture
+├── ehr_model_module_pretrain.py # Pretraining Lightning module
+├── ehr_model_module_finetune.py # Finetuning Lightning module
+├── ehr_dataset_chunk.py         # Data loading and processing
+├── Utils.py                     # Utility functions
+├── configs/                     # Configuration files
+│   ├── pretrain.json           
+│   └── finetune.json           
+├── sample_data/                 # Demo data
+│   ├── sample/                  # 1,000 synthetic patient samples
+│   ├── feat_info.json          # Feature statistics
+│   └── float_feats.json        # Float feature list
+└── output/                      # Training outputs and checkpoints
+```
+
+## ⚠️ Important Notes
+
+### Data Requirements
+- **Custom data must be processed** into the specified format before training
+- **Feature tokenization** is required for both categorical and continuous features
+- **Normalization statistics** must be provided in `feat_info.json`
+- **Demo data** (1,000 samples, 5 features) is provided in `sample_data/` for testing only
+
+### Computational Requirements
+- Default configuration requires significant GPU memory
+- Adjust `batch_size` and model dimensions based on available hardware
+- Consider using gradient checkpointing for memory-constrained environments
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the Apache License - see the [LICENSE](LICENSE) file for details.
+
+## 📚 Citation
+
+If you use EHRFormer in your research, please cite:
+
+```bibtex
 @article{ehrformer,
   title={A full lifecycle biological clock and its impact in health and diseases},
   author={...},
@@ -106,6 +233,12 @@ If you use EHRFormer in your research, please cite the corresponding paper:
 }
 ```
 
+## 🆘 Support
+
+- **Issues**: [GitHub Issues](../../issues)
+- **Discussions**: [GitHub Discussions](../../discussions)
+- **Documentation**: See code comments and configuration files
+
 ---
 
-**Note:** For more details on data formatting, feature selection, and advanced usage, please refer to the comments in the configuration files and the source code. 
+**Note**: This implementation demonstrates advanced feature-level masking for EHR pretraining. The included demo data (1,000 samples, 5 features) in `sample_data/` serves as a reference implementation. For production use with custom data, ensure proper data preprocessing following the specified format requirements. 

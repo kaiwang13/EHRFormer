@@ -18,7 +18,7 @@
     "n_category_values": 2,
     "n_float_values": 256,
     "seq_max_len": 16,
-    "df_paths": "sample_data/finetune",
+    "df_paths": "sample_data/sample",
     "use_cache": true,
     "dataset_col": "dataset_fold10",
     "batch_size": 200,

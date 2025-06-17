@@ -1,3 +1,4 @@
+"""EHRFormer finetuning script for downstream tasks."""
 from ehr_dataset_chunk import EHRDataModule
 from ehr_model_module_finetune import EHRModule
 

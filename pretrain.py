@@ -1,4 +1,5 @@
-from ehr_dataset import EHRDataModule
+"""EHRFormer pretraining script with feature-level masking."""
+from ehr_dataset_chunk import EHRDataModule
 from ehr_model_module_pretrain import EHRModule
 
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
@@ -18,14 +19,10 @@ def main(config):
     n_gpus = config['n_gpus']
     n_epoch = config['n_epoch']
 
-    # data module
     data_module = EHRDataModule(config)
     data_module.setup()
 
-    # model module
     model_module = EHRModule(config)
-
-    # trainer
     log_dir = output_dir / 'log'
     if not config['train'] and config['test']:
         version = get_max_version(str(log_dir))
@@ -54,7 +51,6 @@ def main(config):
     if config['train']:
         trainer = Trainer(
             accelerator='gpu', devices=n_gpus, 
-            # num_nodes=2,
             max_epochs=n_epoch,
             logger=loggers,
             callbacks=callbacks,
@@ -80,5 +76,6 @@ if __name__ == '__main__':
     config = json_load('configs/pretrain.json')
     config['transformer'] = GPT2Config.from_pretrained('gpt2')
     config['transformer'].n_positions = 8192
+    config['mode'] = 'pretrain'
     config['feat_info'] = json_load(config['feat_info_path'])
     main(config)

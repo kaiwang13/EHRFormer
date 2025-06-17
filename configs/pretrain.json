@@ -2,6 +2,7 @@
     "debug": true,
     "project": "ehrformer-pretrain",
     "stage": "pretrain",
+    "mode": "pretrain",
     "name": "ehrformer",
     "model": "ehrformer",
     "output_dir": "output/pretrain",
@@ -19,12 +20,13 @@
     "n_float_feats": 4,
     "n_category_values": 2,
     "n_float_values": 256,
-    "mask_ratio": 0.5,
+    "mask_ratio": 0.15,
     "pool_emb": false,
-    "df_path": "sample_data/pretrain/sample.parquet",
-    "use_cache": false,
+    "seq_max_len": 16,
+    "df_paths": "sample_data/sample",
+    "use_cache": true,
     "dataset_col": "dataset_fold10",
-    "batch_size": 768,
+    "batch_size": 200,
     "train_folds": [
         1,
         2,
@@ -42,8 +44,8 @@
     "test_folds": [
         0,1,2,3,4,5,6,7,8,9
     ],
-    "feat_info_path": "sample_data/pretrain/feat_info.json",
-    "float_feats": "sample_data/pretrain/float_feats.json",
+    "feat_info_path": "sample_data/feat_info.json",
+    "float_feats": "sample_data/float_feats.json",
     "ckpt_path": "path/to/ckpt for inference",
     "pred_folder": "pred"
 }
