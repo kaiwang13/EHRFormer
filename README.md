@@ -138,6 +138,7 @@ The pretraining process:
 2. **Multi-task prediction**: Predicts original feature values at masked positions
 3. **Balanced losses**: Uses both categorical (cross-entropy) and continuous (MSE) reconstruction losses
 
+
 ### Finetuning
 
 Finetune the pretrained model for downstream tasks:
@@ -171,6 +172,10 @@ Modify `configs/pretrain.json` or `configs/finetune.json`:
     "valid_folds": [0]                   // Validation folds
 }
 ```
+
+### Notice
+
+The current data is a small amount of synthetic data because the original large-scale EHR pre-training data cannot be published due to privacy and ethical considerations, so the model may not converge normally. The total time for pretraining and finetuning steps are highly correlated with the data scale, GPU type, and the number of GPUs. Currently, the test results show that on a 1xH100 80G, each step of the pre-training and fine-tuning steps takes less than 10s.
 
 ## 📁 Project Structure
 
