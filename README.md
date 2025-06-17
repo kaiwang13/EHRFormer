@@ -116,7 +116,7 @@ To train EHRFormer on your custom data, you need to process your data into the f
 
 The repository includes demo data in `sample_data/` with:
 - **1,000 synthetic patient samples** in `sample_data/sample/`
-- **4 features** (1 categorical: GENDER, 4 continuous: lab_float_CBC_RBC, lab_float_CBC_WBC, sign_SBP, sign_DBP)
+- **5 features** (1 categorical: GENDER, 4 continuous: lab_float_CBC_RBC, lab_float_CBC_WBC, sign_SBP, sign_DBP)
 - **Pre-processed format** for immediate testing
 - **Feature statistics** in `sample_data/feat_info.json`
 - **Feature list** in `sample_data/float_feats.json`
