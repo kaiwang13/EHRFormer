@@ -170,13 +170,48 @@ class EHRFormer(nn.Module):
         self.config = config 
         self.mode = config.get('mode', 'finetune')
         
+        # VAE components
+        self.n_cls = len(config.get('cls_label_names', []))
+        self.n_reg = len(config.get('reg_label_names', []))
+        
+        # BERT config for VAE encoders/decoder
+        self.bert_config = BertConfig(
+            vocab_size=config['n_category_values']+config['n_float_values']+2,
+            hidden_size=config['transformer'].hidden_size,
+            num_hidden_layers=2,
+            num_attention_heads=12,
+            intermediate_size=config['transformer'].hidden_size * 4,
+            hidden_act="gelu",
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            max_position_embeddings=8192,
+            type_vocab_size=config['n_category_feats']+config['n_float_feats']+1,
+            initializer_range=0.02,
+            layer_norm_eps=1e-12,
+            pad_token_id=1,
+            position_embedding_type="none",
+            use_cache=True,
+            classifier_dropout=None,
+        )
+        
         self.ehr_embed = EHREmbedding(config)
         self.transformer = GPT2Model(config['transformer'])
+        
+        # VAE components
+        self.ehr_mu = BertEncoder(self.bert_config)
+        self.ehr_std = BertEncoder(self.bert_config)
+        self.decoder = BertEncoder(self.bert_config)
         
         if self.mode == 'finetune':
             self.head = MultiTaskHead2(config)
         else:
             self.pretrain_head = MultiTaskHeadPretrain(config)
+    
+    def reparameterize(self, mu, logvar):
+        """VAE reparameterization trick"""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
     def forward(self, cat_feats, float_feats, valid_mask, time_index, **kwargs):
         B = cat_feats.shape[0]
@@ -187,10 +222,21 @@ class EHRFormer(nn.Module):
             attention_mask=valid_mask
         ).last_hidden_state
         
+        # VAE encoding - get mu and std
+        mu_z = self.ehr_mu(y)
+        std_z = self.ehr_std(y)
+        
+        # Reparameterize
+        z = self.reparameterize(mu_z, std_z)
+        
+        # Decode
+        h = self.decoder(z)
+        
         if self.mode == 'finetune':
-            y = rearrange(y, 'b l d -> (b l) d')
-            y_cls = self.head(y, B)
-            return y_cls
+            h = rearrange(h, 'b l d -> (b l) d')
+            y_cls = self.head(h, B)
+            return y_cls, mu_z, std_z
         else:  # pretrain mode
             # For pretraining, we need to predict masked features at each timestamp
-            return self.pretrain_head(y, cat_feats, float_feats, valid_mask)
+            pretrain_output = self.pretrain_head(h, cat_feats, float_feats, valid_mask)
+            return pretrain_output, mu_z, std_z

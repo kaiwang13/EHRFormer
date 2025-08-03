@@ -101,6 +101,13 @@ class EHRModule(pl.LightningModule):
         tqdm_dict.pop('v_num', None)
         return tqdm_dict
 
+    def kl_divergence_loss(self, mu, logvar):
+        """Calculate KL divergence loss for VAE."""
+        # KL(q(z|x) || p(z)) where p(z) = N(0, I)
+        # Formula: 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        return kl_loss.mean()
+
     def training_step(self, batch, batch_idx):
         data = batch['data']
         label = batch['label']
@@ -118,7 +125,8 @@ class EHRModule(pl.LightningModule):
         valid_mask = (cat_valid_mask.any(dim=1) | float_valid_mask.any(dim=1))
         time_index = torch.arange(cat_feats.shape[-1], device=cat_feats.device).unsqueeze(0).repeat(cat_feats.shape[0], 1)
 
-        cls_preds, reg_preds = self.model(cat_feats, float_feats, valid_mask, time_index)
+        # Get model outputs including VAE components
+        (cls_preds, reg_preds), mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
         
         # Regression loss
         reg_loss = 0
@@ -150,11 +158,19 @@ class EHRModule(pl.LightningModule):
         if n_cls_tasks > 0:
             cls_loss = cls_loss / n_cls_tasks
 
-        loss = cls_loss + reg_loss
-        self.log("train_loss", loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        # Calculate KL divergence loss for VAE
+        kl_loss = self.kl_divergence_loss(mu_z, std_z)
+        
+        # ELBO loss = Reconstruction Loss + KL Divergence Loss
+        reconstruction_loss = cls_loss + reg_loss
+        elbo_loss = reconstruction_loss + kl_loss
+        
+        self.log("train_loss", elbo_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         self.log("train_cls_loss", cls_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         self.log("train_reg_loss", reg_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        return loss
+        self.log("train_recon_loss", reconstruction_loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        self.log("train_kl_loss", kl_loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        return elbo_loss
 
     def on_validation_epoch_start(self) -> None:
         self.preds = defaultdict(list)
@@ -177,7 +193,8 @@ class EHRModule(pl.LightningModule):
         valid_mask = (cat_valid_mask.any(dim=1) | float_valid_mask.any(dim=1))
         time_index = torch.arange(cat_feats.shape[-1], device=cat_feats.device).unsqueeze(0).repeat(cat_feats.shape[0], 1)
 
-        cls_preds, reg_preds = self.model(cat_feats, float_feats, valid_mask, time_index)
+        # Get model outputs including VAE components
+        (cls_preds, reg_preds), mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
         
         reg_loss = 0
         n_reg_tasks = 0
@@ -210,7 +227,12 @@ class EHRModule(pl.LightningModule):
         if n_cls_tasks > 0:
             cls_loss = cls_loss / n_cls_tasks
 
-        loss = cls_loss + reg_loss
+        # Calculate KL divergence loss for VAE
+        kl_loss = self.kl_divergence_loss(mu_z, std_z)
+        
+        # ELBO loss = Reconstruction Loss + KL Divergence Loss
+        reconstruction_loss = cls_loss + reg_loss
+        elbo_loss = reconstruction_loss + kl_loss
 
         # Gather tensors for metric computation (following original logic)
         tensor_to_gather = [
@@ -253,10 +275,12 @@ class EHRModule(pl.LightningModule):
                     self.preds[f'reg_{i}'].append(pp[valid_indices])
                     self.targets[f'reg_{i}'].append(yy[valid_indices])
 
-        self.log("val_loss", loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        self.log("val_loss", elbo_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         self.log("val_cls_loss", cls_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         self.log("val_reg_loss", reg_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        return loss
+        self.log("val_recon_loss", reconstruction_loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        self.log("val_kl_loss", kl_loss, prog_bar=False, sync_dist=True, on_epoch=True)
+        return elbo_loss
 
     def on_validation_epoch_end(self) -> None:
         mauc = []
@@ -332,7 +356,8 @@ class EHRModule(pl.LightningModule):
         cls_label = label['cat_feats']
         reg_mask = label['float_valid_mask']
 
-        cls_preds, reg_preds = self.model(cat_feats, float_feats, valid_mask, time_index)
+        # Get model outputs (ignore VAE components for testing)
+        (cls_preds, reg_preds), mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
         
         # Convert to the format expected by original test logic
         # Stack predictions along feature dimension
