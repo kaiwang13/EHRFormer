@@ -231,7 +231,7 @@ If you use EHRFormer in your research, please cite:
 
 ```bibtex
 @article{ehrformer,
-  title={A full lifecycle biological clock and its impact in health and diseases},
+  title={A full lifecycle biological clock based on routine clinical data and its impact in health and diseases},
   author={...},
   journal={...},
   year={...}
