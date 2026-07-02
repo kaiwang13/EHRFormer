@@ -173,3 +173,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .history/
+
+# Prepared patient-derived datasets (generate locally with prepare_data.py; not for public release)
+sample_data/chai500/
+output/

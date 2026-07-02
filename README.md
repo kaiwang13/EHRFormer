@@ -123,6 +123,24 @@ The repository includes demo data in `sample_data/` with:
 
 This serves as a reference for data format and processing pipeline.
 
+### Major disease-category finetuning from lab tests
+
+`prepare_data.py` builds a finetuning dataset for **major disease-category
+prediction** directly from a wide per-visit CHAI parquet, writing the exact
+loader contract (diskcache + `metadata.parquet` + `feat_info.json` +
+`float_feats.json`). Continuous inputs are the `lab_float_*` and `sign_*`
+columns; labels are the top-N most prevalent `diag_*` categories, provided as
+both current (`c_cls_labels`) and future (`f_cls_labels`) targets.
+
+```bash
+python prepare_data.py --src /path/to/per_visit_ehr.parquet \
+                       --out sample_data/chai500 --n-patients 500 --top-n 20
+python finetune.py   # configs/finetune.json points at sample_data/chai500
+```
+
+The generated dataset contains patient-derived data and is git-ignored; run
+`prepare_data.py` locally to reproduce it.
+
 ## 🎯 Usage
 
 ### Pretraining

@@ -192,8 +192,9 @@ class EHRFormer(nn.Module):
             position_embedding_type="none",
             use_cache=True,
             classifier_dropout=None,
+            attn_implementation="eager",
         )
-        
+
         self.ehr_embed = EHREmbedding(config)
         self.transformer = GPT2Model(config['transformer'])
         
@@ -223,14 +224,14 @@ class EHRFormer(nn.Module):
         ).last_hidden_state
         
         # VAE encoding - get mu and std
-        mu_z = self.ehr_mu(y)
-        std_z = self.ehr_std(y)
-        
+        mu_z = self.ehr_mu(y).last_hidden_state
+        std_z = self.ehr_std(y).last_hidden_state
+
         # Reparameterize
         z = self.reparameterize(mu_z, std_z)
-        
+
         # Decode
-        h = self.decoder(z)
+        h = self.decoder(z).last_hidden_state
         
         if self.mode == 'finetune':
             h = rearrange(h, 'b l d -> (b l) d')
