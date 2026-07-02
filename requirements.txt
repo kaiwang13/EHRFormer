@@ -1,0 +1,32 @@
+# EHRFormer dependencies (Python 3.10+).
+# Versions below are the tested, known-good set.
+#
+# PyTorch: install the build matching your CUDA toolkit first. Tested with
+# torch 2.9.1 + CUDA 12.8, e.g.:
+#   pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+# then: pip install -r requirements.txt
+
+# --- core model / training ---
+torch==2.9.1
+transformers==4.57.5
+pytorch-lightning==2.6.0
+torchmetrics==1.8.2
+
+# --- data / numerics ---
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==22.0.0
+scikit-learn==1.7.2
+statsmodels==0.14.6
+einops==0.8.1
+
+# --- training utilities ---
+cosine-annealing-warmup==2.0   # LR scheduler used by the Lightning modules
+diffdist==0.1                  # differentiable distributed gather (ddp_Utils)
+wandb==0.24.0                  # experiment logging (used unless debug=true)
+
+# --- misc (imported by Utils / plotting helpers) ---
+matplotlib==3.10.8
+Pillow==12.1.0
+opencv-python-headless==5.0.0.93
+tqdm==4.67.1

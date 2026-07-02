@@ -38,15 +38,15 @@ A unified transformer-based foundation model for Electronic Health Records (EHR)
 
 2. **Create conda environment**:
    ```bash
-   conda create -n ehrformer python=3.8
+   conda create -n ehrformer python=3.10
    conda activate ehrformer
    ```
 
 3. **Install dependencies**:
    ```bash
-   pip install torch pytorch-lightning transformers
-   pip install pandas numpy scikit-learn tqdm
-   pip install diskcache pyarrow wandb statsmodels
+   # install the torch build matching your CUDA (see requirements.txt), e.g.:
+   pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+   pip install -r requirements.txt
    ```
 
 ### Run with Demo Data
