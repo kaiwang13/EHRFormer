@@ -108,131 +108,114 @@ class EHRModule(pl.LightningModule):
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
         return kl_loss.mean()
 
-    def training_step(self, batch, batch_idx):
-        data = batch['data']
-        label = batch['label']
-        
-        cat_feats = data['cat_feats']
-        float_feats = data['float_feats']
-        cat_valid_mask = data['cat_valid_mask']
-        float_valid_mask = data['float_valid_mask']
-        
-        reg_label = label['float_feats']
-        reg_mask = label['float_valid_mask']
-        cls_label = label['cat_feats']
-        cls_mask = label['cat_valid_mask']
+    @staticmethod
+    def _masked_ce(preds, label, mask):
+        """Masked cross-entropy summed/averaged over categorical feature tasks."""
+        total, n = 0.0, 0
+        for i in range(min(len(preds), label.shape[1])):
+            p = preds[i].reshape(-1, preds[i].shape[-1])
+            y = label[:, i, :].reshape(-1)
+            m = mask[:, i, :].reshape(-1).float()
+            l = F.cross_entropy(p, y, reduction='none')
+            total = total + (l * m).sum() / m.sum().clamp(min=1)
+            n += 1
+        return total / n if n else label.new_zeros((), dtype=torch.float32)
 
-        valid_mask = (cat_valid_mask.any(dim=1) | float_valid_mask.any(dim=1))
-        time_index = torch.arange(cat_feats.shape[-1], device=cat_feats.device).unsqueeze(0).repeat(cat_feats.shape[0], 1)
+    @staticmethod
+    def _masked_mse(preds, label, mask):
+        """Masked MSE summed/averaged over continuous feature tasks."""
+        total, n = 0.0, 0
+        for i in range(min(len(preds), label.shape[1])):
+            p = preds[i].reshape(-1)
+            y = label[:, i, :].reshape(-1).float()
+            m = mask[:, i, :].reshape(-1).float()
+            l = F.mse_loss(p, y, reduction='none')
+            total = total + (l * m).sum() / m.sum().clamp(min=1)
+            n += 1
+        return total / n if n else label.new_zeros((), dtype=torch.float32)
 
-        # Get model outputs including VAE components
-        (cls_preds, reg_preds), mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
-        
-        # Regression loss
-        reg_loss = 0
-        n_reg_tasks = 0
-        if len(reg_preds) > 0 and reg_label.shape[1] > 0:
-            for i in range(min(len(reg_preds), reg_label.shape[1])):
-                y_reg_loss = reg_preds[i].reshape(-1)
-                reg_label_loss = reg_label[:, i, :].reshape(-1)
-                reg_mask_loss = reg_mask[:, i, :].reshape(-1)
-                reg_losses = F.mse_loss(y_reg_loss, reg_label_loss, reduction='none')
-                reg_loss += (reg_losses * reg_mask_loss).sum() / (reg_mask_loss.sum().clip(1))
-                n_reg_tasks += 1
-        
-        if n_reg_tasks > 0:
-            reg_loss = reg_loss / n_reg_tasks
+    def _shared_step(self, batch):
+        """Compute all pretraining objectives (paper Stage-2):
+        current-visit reconstruction + next-visit prediction + age clock +
+        cohort/missing domain-adversarial losses + VAE KL."""
+        data, label = batch['data'], batch['label']
+        cat_feats, float_feats = data['cat_feats'], data['float_feats']
+        valid_mask = (data['cat_valid_mask'].any(dim=1) | data['float_valid_mask'].any(dim=1))
+        time_index = data.get('time_index')
+        if time_index is None:
+            time_index = torch.arange(cat_feats.shape[-1], device=cat_feats.device).unsqueeze(0).repeat(cat_feats.shape[0], 1)
 
-        # Classification loss
-        cls_loss = 0
-        n_cls_tasks = 0
-        if len(cls_preds) > 0 and cls_label.shape[1] > 0:
-            for i in range(min(len(cls_preds), cls_label.shape[1])):
-                y_cls_loss = cls_preds[i].reshape(-1, 2)
-                cls_label_loss = cls_label[:, i, :].reshape(-1)
-                cls_mask_loss = cls_mask[:, i, :].reshape(-1)
-                cls_losses = F.cross_entropy(y_cls_loss, cls_label_loss, reduction='none')
-                cls_loss += (cls_losses * cls_mask_loss).sum() / (cls_mask_loss.sum().clip(1))
-                n_cls_tasks += 1
-        
-        if n_cls_tasks > 0:
-            cls_loss = cls_loss / n_cls_tasks
+        out, mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
+        cls_preds, reg_preds = out['cls'], out['reg']
+        z = mu_z.new_zeros(())
 
-        # Calculate KL divergence loss for VAE
+        # (1) current-visit masked reconstruction
+        cls_loss = self._masked_ce(cls_preds, label['cat_feats'], label['cat_valid_mask'])
+        reg_loss = self._masked_mse(reg_preds, label['float_feats'], label['float_valid_mask'])
+        recon = cls_loss + reg_loss
+
+        # (2) next-examination prediction (autoregressive)
+        next_loss = z
+        if 'cls_next' in out and 'next_cat' in label:
+            next_loss = (self._masked_ce(out['cls_next'], label['next_cat'], label['next_cat_mask'])
+                         + self._masked_mse(out['reg_next'], label['next_float'], label['next_float_mask']))
+
+        # (3) age clock, restricted to healthy visits
+        age_loss = z
+        if 'age' in out and 'age' in label:
+            am = label['age_mask'].reshape(-1).float()
+            al = F.mse_loss(out['age'].reshape(-1), label['age'].reshape(-1), reduction='none')
+            age_loss = (al * am).sum() / am.sum().clamp(min=1)
+
+        # (4) domain-adversarial (cohort + missingness); gradient reversal is in the model
+        cohort_loss = z
+        if 'cohort' in out and 'cohort' in data and out['cohort'].shape[-1] > 1:
+            cohort_loss = F.cross_entropy(out['cohort'], data['cohort'])
+        missing_loss = z
+        if 'missing' in out and 'missing_mask' in data:
+            target = data['missing_mask'].permute(0, 2, 1)         # [B, L, n_feats]
+            vm = valid_mask.unsqueeze(-1).float()
+            ml = F.binary_cross_entropy_with_logits(out['missing'], target, reduction='none')
+            missing_loss = (ml * vm).sum() / vm.sum().clamp(min=1) / target.shape[-1]
+
         kl_loss = self.kl_divergence_loss(mu_z, std_z)
-        
-        # ELBO loss = Reconstruction Loss + KL Divergence Loss
-        reconstruction_loss = cls_loss + reg_loss
-        elbo_loss = reconstruction_loss + kl_loss
-        
-        self.log("train_loss", elbo_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("train_cls_loss", cls_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("train_reg_loss", reg_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("train_recon_loss", reconstruction_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("train_kl_loss", kl_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        return elbo_loss
+        c = self.config
+        total = (recon
+                 + c.get('w_next', 1.0) * next_loss
+                 + c.get('w_age', 1.0) * age_loss
+                 + c.get('w_domain', 0.1) * cohort_loss
+                 + c.get('w_missing', 0.1) * missing_loss
+                 + c.get('w_kl', 0.001) * kl_loss)
+        return {'total': total, 'cls': cls_loss, 'reg': reg_loss, 'recon': recon,
+                'next': next_loss, 'age': age_loss, 'cohort': cohort_loss,
+                'missing': missing_loss, 'kl': kl_loss,
+                'cls_preds': cls_preds, 'reg_preds': reg_preds}
+
+    def _log_losses(self, r, split):
+        for key, name in {'total': 'loss', 'cls': 'cls_loss', 'reg': 'reg_loss',
+                          'recon': 'recon_loss', 'next': 'next_loss', 'age': 'age_loss',
+                          'cohort': 'cohort_loss', 'missing': 'missing_loss', 'kl': 'kl_loss'}.items():
+            self.log(f"{split}_{name}", r[key], prog_bar=False, sync_dist=True, on_epoch=True)
+
+    def training_step(self, batch, batch_idx):
+        r = self._shared_step(batch)
+        self._log_losses(r, 'train')
+        return r['total']
 
     def on_validation_epoch_start(self) -> None:
         self.preds = defaultdict(list)
         self.targets = defaultdict(list)
 
     def validation_step(self, batch, batch_idx):
-        data = batch['data']
         label = batch['label']
-        
-        cat_feats = data['cat_feats']
-        float_feats = data['float_feats']
-        cat_valid_mask = data['cat_valid_mask']
-        float_valid_mask = data['float_valid_mask']
-        
-        reg_label = label['float_feats']
-        reg_mask = label['float_valid_mask']
-        cls_label = label['cat_feats']
-        cls_mask = label['cat_valid_mask']
+        r = self._shared_step(batch)
+        self._log_losses(r, 'val')
 
-        valid_mask = (cat_valid_mask.any(dim=1) | float_valid_mask.any(dim=1))
-        time_index = torch.arange(cat_feats.shape[-1], device=cat_feats.device).unsqueeze(0).repeat(cat_feats.shape[0], 1)
-
-        # Get model outputs including VAE components
-        (cls_preds, reg_preds), mu_z, std_z = self.model(cat_feats, float_feats, valid_mask, time_index)
-        
-        reg_loss = 0
-        n_reg_tasks = 0
-        if len(reg_preds) > 0 and reg_label.shape[1] > 0:
-            for i in range(min(len(reg_preds), reg_label.shape[1])):
-                y_reg_loss = reg_preds[i].reshape(-1)
-                reg_label_loss = reg_label[:, i, :].reshape(-1)
-                reg_mask_loss = reg_mask[:, i, :].reshape(-1)
-                reg_losses = F.mse_loss(y_reg_loss, reg_label_loss, reduction='none')
-                reg_loss += (reg_losses * reg_mask_loss).sum() / (reg_mask_loss.sum().clip(1))
-                n_reg_tasks += 1
-        
-        # Average regression loss over number of regression tasks
-        if n_reg_tasks > 0:
-            reg_loss = reg_loss / n_reg_tasks
-
-        # Compute classification loss
-        cls_loss = 0
-        n_cls_tasks = 0
-        if len(cls_preds) > 0 and cls_label.shape[1] > 0:
-            for i in range(min(len(cls_preds), cls_label.shape[1])):
-                y_cls_loss = cls_preds[i].reshape(-1, 2)
-                cls_label_loss = cls_label[:, i, :].reshape(-1)
-                cls_mask_loss = cls_mask[:, i, :].reshape(-1)
-                cls_losses = F.cross_entropy(y_cls_loss, cls_label_loss, reduction='none')
-                cls_loss += (cls_losses * cls_mask_loss).sum() / (cls_mask_loss.sum().clip(1))
-                n_cls_tasks += 1
-        
-        # Average classification loss over number of classification tasks
-        if n_cls_tasks > 0:
-            cls_loss = cls_loss / n_cls_tasks
-
-        # Calculate KL divergence loss for VAE
-        kl_loss = self.kl_divergence_loss(mu_z, std_z)
-        
-        # ELBO loss = Reconstruction Loss + KL Divergence Loss
-        reconstruction_loss = cls_loss + reg_loss
-        elbo_loss = reconstruction_loss + kl_loss
+        # names kept for the metric-gathering block below
+        cls_preds, reg_preds = r['cls_preds'], r['reg_preds']
+        cls_label, cls_mask = label['cat_feats'], label['cat_valid_mask']
+        reg_label, reg_mask = label['float_feats'], label['float_valid_mask']
+        elbo_loss = r['total']
 
         # Gather tensors for metric computation (following original logic)
         tensor_to_gather = [
@@ -275,11 +258,6 @@ class EHRModule(pl.LightningModule):
                     self.preds[f'reg_{i}'].append(pp[valid_indices])
                     self.targets[f'reg_{i}'].append(yy[valid_indices])
 
-        self.log("val_loss", elbo_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("val_cls_loss", cls_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("val_reg_loss", reg_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("val_recon_loss", reconstruction_loss, prog_bar=False, sync_dist=True, on_epoch=True)
-        self.log("val_kl_loss", kl_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         return elbo_loss
 
     def on_validation_epoch_end(self) -> None:

@@ -61,10 +61,10 @@ python pretrain.py
 python finetune.py
 ```
 
-The demo data includes:
-- 1,000 synthetic patient samples
-- 5 features (1 categorical, 4 continuous)
-- Pre-configured paths in `configs/*.json`
+The demo data (`sample_data/sample/data.parquet`) is a raw per-visit dataset of
+500 de-identified patients with 150 continuous lab/vital
+features and 20 major disease categories; continuous features are discretized
+on the fly by the loader. Regenerate it with `prepare_data.py` (see below).
 
 ## 📊 Data Format Requirements
 
@@ -75,25 +75,31 @@ To train EHRFormer on your custom data, you need to process your data into the f
 #### Required DataFrame Columns
 
 ```python
-# Each row represents one patient sequence
+# One row per patient in a single data.parquet (arrays stored as nested lists).
+# Continuous features are RAW (NaN = missing); the loader discretizes on the fly.
 {
-    'pid': str,                           # Patient ID (unique identifier)
-    'tokenized_category_feats': ndarray,  # (n_cat, seq_len) - Discretized categorical features
-    'tokenized_float_feats': ndarray,     # (n_float, seq_len) - Discretized continuous features  
-    'category_feats': ndarray,            # (n_cat, seq_len) - Original categorical values
-    'float_feats': ndarray,               # (n_float, seq_len) - Original continuous values
-    'valid_mask': ndarray,                # (seq_len,) - Valid timestamp mask
-    'time_index': ndarray,                # (seq_len,) - Time indices
-    'dataset_fold10': int                 # Dataset fold for train/val/test split
+    'pid': str,                # Patient ID
+    'float_raw': ndarray,      # (n_float, seq_len)   raw continuous values, NaN = missing
+    'cat_feats': ndarray,      # (n_cat, seq_len)     categorical token ids, -1 = missing
+    'valid_mask': ndarray,     # (seq_len,)           real vs padded visits
+    'time_index': ndarray,     # (seq_len,)           days since first visit
+    'c_cls_labels': ndarray,   # (n_disease, seq_len) current diagnosis (finetune)
+    'f_cls_labels': ndarray,   # (n_disease, seq_len) future diagnosis (finetune)
+    'c_reg_labels': ndarray,   # (n_reg, seq_len)     regression targets, e.g. age
+    'healthy': ndarray,        # (seq_len,)           1 = no diagnosis at visit (age clock)
+    'cohort': int,             # data-source id (domain-adversarial de-biasing)
+    'diag_cols': list,         # disease-category names
+    'reg_cols': list,          # regression target names
+    'dataset_fold10': int      # patient-level fold for train/val/test
 }
 ```
 
 #### Data Processing Steps
 
-1. **Tokenization**: Convert categorical and continuous features to token indices
-   - Categorical: Map categories to integer tokens (0, 1, 2, ...)
-   - Continuous: Quantize values to discrete tokens (e.g., 0-255 for 256 bins)
-   - Missing values: Use -1 as missing token
+1. **On-the-fly tokenization**: store RAW continuous values (NaN = missing); the
+   loader discretizes them to `n_float_values` bins per feature at read time via a
+   shared `FeatureSchema` (from `feat_info.json`). Categorical features are stored
+   as integer token ids (-1 = missing). No pre-tokenization / diskcache is needed.
 
 2. **Sequence Formatting**: Organize data by timestamps
    - Each feature becomes a sequence across time
@@ -114,32 +120,28 @@ To train EHRFormer on your custom data, you need to process your data into the f
 
 ### Demo Data
 
-The repository includes demo data in `sample_data/` with:
-- **1,000 synthetic patient samples** in `sample_data/sample/`
-- **5 features** (1 categorical: GENDER, 4 continuous: lab_float_CBC_RBC, lab_float_CBC_WBC, sign_SBP, sign_DBP)
-- **Pre-processed format** for immediate testing
-- **Feature statistics** in `sample_data/feat_info.json`
-- **Feature list** in `sample_data/float_feats.json`
-
-This serves as a reference for data format and processing pipeline.
+The repository includes demo data in `sample_data/`:
+- **500 de-identified patients** in `sample_data/sample/data.parquet` (a single
+  single raw parquet; no diskcache)
+- **150 continuous lab/vital features** (`lab_float_*`, `sign_*`) + gender
+- **20 major disease categories** as current/future per-visit labels
+- **Feature statistics** in `sample_data/feat_info.json`, feature list in
+  `sample_data/float_feats.json`
 
 ### Major disease-category finetuning from lab tests
 
-`prepare_data.py` builds a finetuning dataset for **major disease-category
-prediction** directly from a wide per-visit CHAI parquet, writing the exact
-loader contract (diskcache + `metadata.parquet` + `feat_info.json` +
-`float_feats.json`). Continuous inputs are the `lab_float_*` and `sign_*`
-columns; labels are the top-N most prevalent `diag_*` categories, provided as
-both current (`c_cls_labels`) and future (`f_cls_labels`) targets.
+`prepare_data.py` builds this dataset for **major disease-category prediction**
+directly from a wide per-visit EHR parquet, writing a single self-contained
+`sample_data/sample/data.parquet` plus `feat_info.json` / `float_feats.json`.
+Continuous inputs are the `lab_float_*` and `sign_*` columns (stored raw,
+discretized on the fly); labels are the top-N most prevalent `diag_*` categories
+as current (`c_cls_labels`) and future (`f_cls_labels`) per-visit targets.
 
 ```bash
 python prepare_data.py --src /path/to/per_visit_ehr.parquet \
-                       --out sample_data/chai500 --n-patients 500 --top-n 20
-python finetune.py   # configs/finetune.json points at sample_data/chai500
+                       --out sample_data --n-patients 500 --top-n 20
+python finetune.py   # configs/finetune.json points at sample_data/sample
 ```
-
-The generated dataset contains patient-derived data and is git-ignored; run
-`prepare_data.py` locally to reproduce it.
 
 ## 🎯 Usage
 
@@ -151,10 +153,13 @@ Train the model with self-supervised feature-level masking:
 python pretrain.py
 ```
 
-The pretraining process:
-1. **Feature-level masking**: Randomly masks 50% of valid features at each timestamp
-2. **Multi-task prediction**: Predicts original feature values at masked positions
-3. **Balanced losses**: Uses both categorical (cross-entropy) and continuous (MSE) reconstruction losses
+The pretraining process jointly optimizes the paper's self-supervised objectives:
+1. **Dual stochastic masking**: masks 50% of valid features per visit and reconstructs
+   them in the **current and next** examination (categorical CE + continuous MSE)
+2. **Variational framework (ELBO)**: VAE latent with a weighted KL term
+3. **Age clock**: per-visit age regression on *healthy* visits (biological age)
+4. **Domain-adversarial de-biasing**: cohort and missingness discriminators behind a
+   gradient-reversal layer → cohort-invariant and missing-invariant representations
 
 
 ### Finetuning
@@ -181,11 +186,17 @@ Modify `configs/pretrain.json` or `configs/finetune.json`:
     "batch_size": 32,                     // Batch size
     "lr": 1e-4,                          // Learning rate
     "n_epoch": 100,                      // Number of epochs
-    "seq_max_len": 64,                   // Maximum sequence length
+    "seq_max_len": 16,                   // Maximum sequence length (visits)
+    "n_encoder_layers": 2,               // examination-encoder depth (paper: 24)
+    "encoder_hidden": 768,               // examination-encoder width (paper: 1024)
+    "mask_ratio": 0.5,                   // fraction of features masked per visit
+    "predict_next_visit": true,          // next-examination prediction
+    "w_next": 1.0, "w_age": 1.0,         // next-visit / age-clock loss weights
+    "w_domain": 0.1, "w_missing": 0.1,   // cohort / missingness adversarial weights
+    "w_kl": 0.001,                       // KL weight (ELBO)
     "df_paths": "sample_data/sample",    // Data directory (demo data)
     "feat_info_path": "sample_data/feat_info.json", // Feature statistics
     "float_feats": "sample_data/float_feats.json",  // Float feature list
-    "use_cache": true,                   // Enable data caching
     "train_folds": [1,2,3,4,5,6,7,8,9], // Training folds
     "valid_folds": [0]                   // Validation folds
 }
@@ -193,7 +204,7 @@ Modify `configs/pretrain.json` or `configs/finetune.json`:
 
 ### Notice
 
-The current data is a small amount of synthetic data because the original large-scale EHR pre-training data cannot be published due to privacy and ethical considerations, so the model may not converge normally. The total time for pretraining and finetuning steps are highly correlated with the data scale, GPU type, and the number of GPUs. Currently, the test results show that on a 1xH100 80G, each step of the pre-training and fine-tuning steps takes less than 10s.
+The demo data is a small de-identified 500-patient sample; the original large-scale EHR pre-training data cannot be published due to privacy and ethical considerations, so the model may not converge to clinically meaningful performance on this sample. The total time for pretraining and finetuning steps is highly correlated with the data scale, GPU type, and the number of GPUs. Currently, the test results show that on a 1xH100 80G, each step of the pre-training and fine-tuning steps takes less than 10s.
 
 ## 📁 Project Structure
 

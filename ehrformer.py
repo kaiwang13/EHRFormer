@@ -26,21 +26,40 @@ class GradientReversalLayer(nn.Module):
     def forward(self, x):
         return GradientReversalFunction.apply(x, self.lambda_)
         
-class DomainDiscriminator(nn.Module):
-    def __init__(self, config):
+def masked_mean(x, mask):
+    """Mean of x [B, L, D] over L, weighted by mask [B, L]."""
+    m = mask.unsqueeze(-1).to(x.dtype)
+    return (x * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6)
+
+
+class CohortDiscriminator(nn.Module):
+    """Predicts the originating cohort from the pooled patient representation.
+
+    Placed behind a gradient-reversal layer so that minimizing its loss drives
+    the encoder toward cohort-invariant (batch-effect-free) representations
+    (paper: cohort-agnostic adversarial training)."""
+    def __init__(self, hidden, proj, n_cohorts):
         super().__init__()
-        self.output_dim = config['output_dim']
-        self.proj_dim = config['proj_dim']
         self.grl = GradientReversalLayer()
-        self.fc = nn.Sequential(
-            nn.Linear(self.output_dim, self.proj_dim),
-            nn.ReLU(),
-            nn.Linear(self.proj_dim, 4)
-        )
-    def forward(self, x):
-        x = self.grl(x)
-        x = self.fc(x)
-        return x
+        self.fc = nn.Sequential(nn.Linear(hidden, proj), nn.ReLU(), nn.Linear(proj, n_cohorts))
+
+    def forward(self, x, lambda_=1.0):
+        self.grl.lambda_ = lambda_
+        return self.fc(self.grl(x))
+
+
+class MissingnessDiscriminator(nn.Module):
+    """Predicts the per-visit, per-feature missingness pattern from the
+    representation, behind a gradient-reversal layer, to encourage
+    missing-invariant representations (paper: missing-data discrimination)."""
+    def __init__(self, hidden, proj, n_feats):
+        super().__init__()
+        self.grl = GradientReversalLayer()
+        self.fc = nn.Sequential(nn.Linear(hidden, proj), nn.ReLU(), nn.Linear(proj, n_feats))
+
+    def forward(self, x, lambda_=1.0):   # x: [B, L, D] -> [B, L, n_feats]
+        self.grl.lambda_ = lambda_
+        return self.fc(self.grl(x))
 
 class EHREmbedding(nn.Module):
     def __init__(self, config):
@@ -56,12 +75,15 @@ class EHREmbedding(nn.Module):
             "zero", torch.zeros(1, dtype=torch.long), persistent=False
         )
 
+        dec_hidden = config['transformer'].hidden_size
+        enc_hidden = config.get('encoder_hidden', dec_hidden)      # paper: 1024
+        n_enc_layers = config.get('n_encoder_layers', 1)           # paper: 24
         self.bert = BertModel(BertConfig(
             vocab_size=config['n_category_values']+config['n_float_values']+2,  # 1 for padding, 0 for CLS
-            hidden_size=config['transformer'].hidden_size,
-            num_hidden_layers=1,
-            num_attention_heads=12,
-            intermediate_size=config['transformer'].hidden_size * 4,
+            hidden_size=enc_hidden,
+            num_hidden_layers=n_enc_layers,
+            num_attention_heads=config.get('encoder_heads', 12),
+            intermediate_size=enc_hidden * 4,
             hidden_act="gelu",
             hidden_dropout_prob=0.1,
             attention_probs_dropout_prob=0.1,
@@ -73,7 +95,10 @@ class EHREmbedding(nn.Module):
             position_embedding_type="none",
             use_cache=True,
             classifier_dropout=None,
+            attn_implementation="eager",
         ))
+        # project the examination-encoder output to the temporal-decoder width if they differ
+        self.proj = nn.Linear(enc_hidden, dec_hidden) if enc_hidden != dec_hidden else nn.Identity()
 
     def forward(self, cat_feats, float_feats):  # cat_feats: (b, nc, l), float_feats: (b, nf, l)
         B = cat_feats.shape[0]
@@ -97,6 +122,7 @@ class EHREmbedding(nn.Module):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids
         ).pooler_output
+        ft_emb = self.proj(ft_emb)
         ft_emb = rearrange(ft_emb, '(b l) d -> b l d', b=B)
         return ft_emb  # time_index: (b, l, d)
 
@@ -122,46 +148,43 @@ class MultiTaskHead2(nn.Module):
         return results
 
 class MultiTaskHeadPretrain(nn.Module):
-    """Pretraining head for feature-level masked prediction."""
+    """Pretraining head: reconstructs masked features in the CURRENT visit and
+    predicts the NEXT visit's values (paper: masked prediction over current and
+    next examination), plus a per-visit age-regression head (biological clock)."""
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.output_dim = config['transformer'].hidden_size
         self.n_cls = len(config.get('cls_label_names', []))
         self.n_reg = len(config.get('reg_label_names', []))
-        
-        # Heads for predicting categorical features
-        self.cls_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.output_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, 2)  # Binary classification for each categorical feature
-            ) for _ in range(self.n_cls)
-        ])
-        
-        # Heads for predicting continuous features  
-        self.reg_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.output_dim, 256),
-                nn.ReLU(),
-                nn.Linear(256, 1)
-            ) for _ in range(self.n_reg)
-        ])
+        self.predict_next = config.get('predict_next_visit', True)
+
+        def cls_head():
+            return nn.Sequential(nn.Linear(self.output_dim, 256), nn.ReLU(), nn.Linear(256, 2))
+
+        def reg_head():
+            return nn.Sequential(nn.Linear(self.output_dim, 256), nn.ReLU(), nn.Linear(256, 1))
+
+        # current-visit reconstruction heads
+        self.cls_heads = nn.ModuleList([cls_head() for _ in range(self.n_cls)])
+        self.reg_heads = nn.ModuleList([reg_head() for _ in range(self.n_reg)])
+        # next-visit prediction heads (autoregressive)
+        if self.predict_next:
+            self.next_cls_heads = nn.ModuleList([cls_head() for _ in range(self.n_cls)])
+            self.next_reg_heads = nn.ModuleList([reg_head() for _ in range(self.n_reg)])
+        # biological-clock age regression
+        self.age_head = reg_head()
 
     def forward(self, hidden_states, cat_feats, float_feats, valid_mask):
-        B, L, D = hidden_states.shape
-        
-        cls_predictions = []
-        for i, cls_head in enumerate(self.cls_heads):
-            pred = cls_head(hidden_states)
-            cls_predictions.append(pred)
-        
-        reg_predictions = []
-        for i, reg_head in enumerate(self.reg_heads):
-            pred = reg_head(hidden_states).squeeze(-1)
-            reg_predictions.append(pred)
-            
-        return cls_predictions, reg_predictions
+        out = {
+            'cls': [head(hidden_states) for head in self.cls_heads],              # each [B, L, 2]
+            'reg': [head(hidden_states).squeeze(-1) for head in self.reg_heads],  # each [B, L]
+            'age': self.age_head(hidden_states).squeeze(-1),                      # [B, L]
+        }
+        if self.predict_next:
+            out['cls_next'] = [head(hidden_states) for head in self.next_cls_heads]
+            out['reg_next'] = [head(hidden_states).squeeze(-1) for head in self.next_reg_heads]
+        return out
 
 class EHRFormer(nn.Module):
     """Unified EHRFormer model for both pretraining and finetuning."""
@@ -207,7 +230,14 @@ class EHRFormer(nn.Module):
             self.head = MultiTaskHead2(config)
         else:
             self.pretrain_head = MultiTaskHeadPretrain(config)
-    
+            # domain-adversarial discriminators (gradient reversal) for
+            # cohort-invariant and missing-invariant representations
+            hidden = config['transformer'].hidden_size
+            proj = config.get('proj_dim', 256)
+            n_feats = config['n_category_feats'] + config['n_float_feats']
+            self.cohort_disc = CohortDiscriminator(hidden, proj, config.get('n_cohorts', 1))
+            self.missing_disc = MissingnessDiscriminator(hidden, proj, n_feats)
+
     def reparameterize(self, mu, logvar):
         """VAE reparameterization trick"""
         std = torch.exp(0.5 * logvar)
@@ -238,6 +268,10 @@ class EHRFormer(nn.Module):
             y_cls = self.head(h, B)
             return y_cls, mu_z, std_z
         else:  # pretrain mode
-            # For pretraining, we need to predict masked features at each timestamp
+            # reconstruct current + predict next examination, + age (biological clock)
             pretrain_output = self.pretrain_head(h, cat_feats, float_feats, valid_mask)
+            # domain-adversarial heads (gradient reversal happens inside the discriminators)
+            grl_lambda = self.config.get('grl_lambda', 1.0)
+            pretrain_output['cohort'] = self.cohort_disc(masked_mean(h, valid_mask), grl_lambda)
+            pretrain_output['missing'] = self.missing_disc(h, grl_lambda)
             return pretrain_output, mu_z, std_z

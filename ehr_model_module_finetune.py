@@ -200,9 +200,9 @@ class EHRModule(pl.LightningModule):
         # Calculate KL divergence loss for VAE
         kl_loss = self.kl_divergence_loss(mu_z, std_z)
         
-        # ELBO loss = Reconstruction Loss + KL Divergence Loss
+        # ELBO loss = Reconstruction Loss + weighted KL Divergence Loss
         reconstruction_loss = cls_loss + reg_loss
-        elbo_loss = reconstruction_loss + kl_loss
+        elbo_loss = reconstruction_loss + self.config.get('w_kl', 0.001) * kl_loss
         
         self.log("train_loss", elbo_loss, prog_bar=False, sync_dist=True, on_epoch=True)
         self.log("train_recon_loss", reconstruction_loss, prog_bar=False, sync_dist=True, on_epoch=True)
@@ -254,9 +254,9 @@ class EHRModule(pl.LightningModule):
         # Calculate KL divergence loss for VAE
         kl_loss = self.kl_divergence_loss(mu_z, std_z)
         
-        # ELBO loss = Reconstruction Loss + KL Divergence Loss
+        # ELBO loss = Reconstruction Loss + weighted KL Divergence Loss
         reconstruction_loss = cls_loss + reg_loss
-        elbo_loss = reconstruction_loss + kl_loss
+        elbo_loss = reconstruction_loss + self.config.get('w_kl', 0.001) * kl_loss
 
         loss = elbo_loss
         tensor_to_gather = [

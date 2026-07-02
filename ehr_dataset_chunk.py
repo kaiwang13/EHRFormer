@@ -1,445 +1,305 @@
+"""EHRFormer data loading.
+
+Each patient is stored as one row of a single ``data.parquet`` holding *raw*
+per-visit features (NaN = missing) plus per-visit labels. There is no external
+diskcache: continuous features are discretized **on the fly** in ``__getitem__``
+via a :class:`FeatureSchema`, following the paper's Stage-1 tokenization
+(``floor((x - min)/(max - min) * n_bins)``, missing -> -1). Records are stored
+raw and share a single feature schema.
+
+The batch structure produced here is unchanged from the previous loader, so the
+pretraining / finetuning Lightning modules consume it without modification.
+"""
+
 from pathlib import Path
-import random
-import pytorch_lightning as pl
-import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-from dataclasses import dataclass
-import torch
-import numpy as np
-import torch.nn.functional as F
-import pyarrow.parquet as pq
-import pyarrow as pa
-import diskcache
-import gc
 import json
-from Utils import *
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
 
 
-def optimize_dtypes(df):
-    for col in df.columns:
-        if pd.api.types.is_integer_dtype(df[col]):
-            col_min, col_max = df[col].min(), df[col].max()
-            
-            if col_min >= 0:
-                if col_max < 2**8:
-                    df[col] = df[col].astype(np.uint8)
-                elif col_max < 2**16:
-                    df[col] = df[col].astype(np.uint16)
-                elif col_max < 2**32:
-                    df[col] = df[col].astype(np.uint32)
-            else:
-                if col_min > -2**7 and col_max < 2**7:
-                    df[col] = df[col].astype(np.int8)
-                elif col_min > -2**15 and col_max < 2**15:
-                    df[col] = df[col].astype(np.int16)
-                elif col_min > -2**31 and col_max < 2**31:
-                    df[col] = df[col].astype(np.int32)
-        
-        elif pd.api.types.is_float_dtype(df[col]):
-            df[col] = df[col].astype(np.float32)
-            
-        elif pd.api.types.is_string_dtype(df[col]) and df[col].nunique() / len(df[col]) < 0.5:
-            df[col] = df[col].astype('category')
-            
-    return df
+def load_parquet(path):
+    return pd.read_parquet(path)
 
-def sample_subset(mask, prob):
-    """Sample subset of valid indices for masking, following original logic"""
-    valid_indices = np.where(mask)[0]
-    if len(valid_indices) == 0:
-        return np.array([], dtype=int), np.array([], dtype=int)
-    
-    n_total = len(valid_indices)
-    n_output = max(1, int(n_total * prob))
-    
-    # Randomly select indices for output (masked prediction)
-    output_indices = np.random.choice(valid_indices, size=n_output, replace=False)
-    
-    # Remaining indices are for input
-    input_indices = np.setdiff1d(valid_indices, output_indices)
-    
-    return input_indices, output_indices
 
-@dataclass
-class ChunkedEHRDataset(Dataset):
-    data_chunks: list  
-    mode: str
-    config: dict
+def _stack(cell, dtype):
+    """Reconstruct a 2-D numpy array from a parquet list<list<...>> cell."""
+    return np.stack(list(cell)).astype(dtype)
 
-    def __post_init__(self):
-        self.df_paths = self.config['df_paths']
-        self.use_cache = self.config['use_cache']
-        if self.use_cache:
-            
-            self.caches = [
-                diskcache.Cache(path, eviction_policy='none')
-                for path in self.df_paths
-            ]
-            
-        self.chunk_lengths = [len(chunk) for chunk in self.data_chunks]
-        self.cumulative_lengths = np.cumsum(self.chunk_lengths)
-        self.total_length = self.cumulative_lengths[-1] if self.chunk_lengths else 0
-        
-        
+
+class FeatureSchema:
+    """Per-feature discretization statistics for on-the-fly tokenization.
+
+    Continuous features are binned into ``n_float_bins`` levels using the min/max
+    fitted on the training cohort; ``mean_std`` is used to normalize continuous
+    reconstruction targets during pretraining. The float-feature order is the
+    sorted ``feat_info['float_cols']`` order, which must match the row order of
+    the ``float_raw`` arrays written by ``prepare_data.py``.
+    """
+
+    def __init__(self, feat_info: dict, n_float_bins: int):
+        self.category_cols = sorted(feat_info["category_cols"])
+        self.float_cols = sorted(feat_info["float_cols"].keys())
+        self.n_float_bins = n_float_bins
+        fc = feat_info["float_cols"]
+        self.float_min = np.array([fc[c]["min"] for c in self.float_cols], dtype=np.float32)[:, None]
+        self.float_max = np.array([fc[c]["max"] for c in self.float_cols], dtype=np.float32)[:, None]
+        self.mean_std = np.array([(fc[c]["mean"], fc[c]["std"]) for c in self.float_cols], dtype=np.float32)
+        self.float_mean = self.mean_std[:, 0][:, None]
+        self.float_std = self.mean_std[:, 1][:, None] + 1e-8
+        self.age_mean = float(feat_info.get("age_mean", 0.0))
+        self.age_std = float(feat_info.get("age_std", 1.0)) + 1e-8
+        self.n_cohorts = int(feat_info.get("n_cohorts", 1))
+
+    def discretize(self, float_raw: np.ndarray) -> np.ndarray:
+        """float_raw: [n_float, L] with NaN for missing -> int tokens [n_float, L], -1 missing."""
+        rng = np.maximum(self.float_max - self.float_min, 1e-8)
+        b = np.floor((float_raw - self.float_min) / rng * self.n_float_bins)
+        b = np.clip(b, 0, self.n_float_bins - 1)
+        b = np.where(np.isnan(float_raw), -1, b)
+        return b.astype(np.int64)
+
+    @classmethod
+    def from_config(cls, config: dict) -> "FeatureSchema":
+        with open(config["feat_info_path"]) as f:
+            feat_info = json.load(f)
+        return cls(feat_info, config["n_float_values"])
+
+
+class EHRDataset(Dataset):
+    """Reads raw per-patient records from a dataframe and tokenizes on the fly."""
+
+    def __init__(self, df: pd.DataFrame, schema: FeatureSchema, config: dict, mode: str):
+        self.df = df.reset_index(drop=True)
+        self.schema = schema
+        self.config = config
+        self.mode = mode
+        self.mask_ratio = config.get("mask_ratio", 0.5)
+        self.seq_max_len = config["seq_max_len"]
         self._setup_config()
 
     def _setup_config(self):
-        self.dataframe_cols = set().union(*[set(chunk.columns) for chunk in self.data_chunks])
-        self.config['cls_label_names'] = []
-        self.config['reg_label_names'] = []
-        self.config['n_cls'] = []
-        
-        is_pretraining = self.config.get('mode') == 'pretrain'
-        
-        if is_pretraining:
-            if 'feat_info' in self.config:
-                self.cls_label_names = sorted(self.config['feat_info']['category_cols'])
-                self.reg_label_names = sorted([x for x in self.config['feat_info']['float_cols'].keys()])
-                
-                self.cat_cols = [f'tokenized.{x}' for x in self.cls_label_names]
-                self.float_cols = self.reg_label_names
-                self.input_float_cols = [f'tokenized.{x}' for x in self.float_cols]
-                self.output_float_cols = self.float_cols
-                
-                self.mean_std = np.array([
-                    (self.config['feat_info']['float_cols'][x]['mean'], 
-                     self.config['feat_info']['float_cols'][x]['std']) 
-                    for x in self.output_float_cols
-                ], dtype=np.float32)
-                
-                self.config['mean_std'] = self.mean_std
-                self.config['cls_label_names'] = self.cls_label_names
-                self.config['reg_label_names'] = self.reg_label_names
-                
-                self.mask_ratio = self.config.get('mask_ratio', 0.15)
-            else:
-                raise ValueError("feat_info required for pretraining mode")
-                        
-        else:
-            first_row = self.data_chunks[0].iloc[0]
-            
-            for label_cols, cols, n_cls in zip(
-                self.config['cls_label_cols'],
-                self.config['cls_label_name_cols'],
-                self.config['cls_label_n_cls']
-            ):
-                for col in first_row[cols]:
-                    self.config['cls_label_names'].append(f'{label_cols}_{col}')
-                    self.config['n_cls'].append(n_cls)
-                    
-            for label_cols, cols in zip(
-                self.config['reg_label_cols'],
-                self.config['reg_label_name_cols']
-            ):
-                for col in first_row[cols]:
-                    self.config['reg_label_names'].append(f'{label_cols}_{col}')
-                    self.config['n_cls'].append(1)
-        
-        self.seq_max_len = self.config['seq_max_len']
+        """Populate cls/reg label names + head sizes on the shared config."""
+        if self.mode == "pretrain":
+            # reconstruction targets: categorical (CE) and continuous (MSE) features
+            self.config["cls_label_names"] = list(self.schema.category_cols)
+            self.config["reg_label_names"] = list(self.schema.float_cols)
+            self.config["mean_std"] = self.schema.mean_std
+            self.config["mask_ratio"] = self.mask_ratio
+            self.config["n_cls"] = []
+            return
+        first = self.df.iloc[0]
+        cls_names, n_cls = [], []
+        for label_col, name_col, n in zip(
+            self.config["cls_label_cols"],
+            self.config["cls_label_name_cols"],
+            self.config["cls_label_n_cls"],
+        ):
+            for col in first[name_col]:
+                cls_names.append(f"{label_col}_{col}")
+                n_cls.append(n)
+        reg_names = []
+        for label_col, name_col in zip(self.config["reg_label_cols"], self.config["reg_label_name_cols"]):
+            for col in first[name_col]:
+                reg_names.append(f"{label_col}_{col}")
+                n_cls.append(1)
+        self.config["cls_label_names"] = cls_names
+        self.config["reg_label_names"] = reg_names
+        self.config["n_cls"] = n_cls
 
-    def get_from_cache(self, pid):
-        if not self.use_cache:
-            return None
-            
-        for cache in self.caches:
-            try:
-                data = cache.get(pid, default=None)
-                if data is not None:
-                    return data
-            except:
-                continue
-        return None
+    def __len__(self):
+        return len(self.df)
 
-    def read_col(self, chunk_idx: int, within_chunk_idx: int, data: dict, col: str):
-        if col in self.dataframe_cols:
-            return self.data_chunks[chunk_idx].iloc[within_chunk_idx][col]
-        return data[col]
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        float_raw = _stack(row["float_raw"], np.float32)      # [n_float, L] (NaN=missing)
+        cat = _stack(row["cat_feats"], np.int64)              # [n_cat, L] (raw tokens, -1=missing)
+        valid_mask = np.asarray(row["valid_mask"], dtype=bool)
+        time_index = np.asarray(row["time_index"], dtype=np.int64)
 
-    def read_sample(self, chunk_idx: int, within_chunk_idx: int, data: dict):
-        cat_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'tokenized_category_feats')
-        float_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'tokenized_float_feats')
-        valid_mask = self.read_col(chunk_idx, within_chunk_idx, data, 'valid_mask')
-        time_index = self.read_col(chunk_idx, within_chunk_idx, data, 'time_index')
+        tok_float = self.schema.discretize(float_raw)         # on-the-fly discretization
+        tok_cat = np.where(cat < 0, -1, cat).astype(np.int64)
 
-        
-        tensors = {
-            'cat_feats': torch.from_numpy(cat_feats.astype(np.int64)),
-            'float_feats': torch.from_numpy(float_feats.astype(np.int64)),
-            'valid_mask': torch.from_numpy(valid_mask.astype(bool)),
-            'time_index': torch.from_numpy(time_index.astype(np.int64))
+        if self.mode == "pretrain":
+            sample, label = self._mask_pretrain(tok_cat, tok_float, cat, float_raw, valid_mask, time_index)
+            n_cat, L = tok_cat.shape
+            n_float = tok_float.shape[0]
+
+            # (a) missingness target: original absence per feature per visit [n_cat+n_float, L]
+            missing = np.concatenate([cat < 0, np.isnan(float_raw)], axis=0).astype(np.float32)
+
+            # (b) next-examination targets: visit t predicts visit t+1
+            pair_valid = np.zeros(L, dtype=bool)
+            pair_valid[: L - 1] = valid_mask[: L - 1] & valid_mask[1:]
+            cat_next = np.concatenate([cat[:, 1:], np.full((n_cat, 1), -1)], axis=1)
+            float_next = np.concatenate([float_raw[:, 1:], np.full((n_float, 1), np.nan)], axis=1)
+            next_cat_mask = (cat_next >= 0) & pair_valid[None, :]
+            next_cat = np.where(cat_next >= 0, cat_next, 0).astype(np.int64)
+            next_float_mask = (~np.isnan(float_next)) & pair_valid[None, :]
+            next_float = np.where(np.isnan(float_next), 0.0,
+                                  (float_next - self.schema.float_mean) / self.schema.float_std).astype(np.float32)
+
+            # (c) age clock (normalized), restricted to healthy visits
+            age = _stack(row["c_reg_labels"], np.float32)[0]      # [L] raw age
+            age_norm = np.nan_to_num((age - self.schema.age_mean) / self.schema.age_std, nan=0.0).astype(np.float32)
+            healthy = np.asarray(row["healthy"], dtype=bool)
+            age_mask = healthy & valid_mask
+
+            sample["missing_mask"] = torch.tensor(missing, dtype=torch.float32)
+            sample["cohort"] = torch.tensor(int(row["cohort"]), dtype=torch.long)
+            label["next_cat"] = torch.tensor(next_cat, dtype=torch.long)
+            label["next_cat_mask"] = torch.tensor(next_cat_mask, dtype=torch.bool)
+            label["next_float"] = torch.tensor(next_float, dtype=torch.float32)
+            label["next_float_mask"] = torch.tensor(next_float_mask, dtype=torch.bool)
+            label["age"] = torch.tensor(age_norm, dtype=torch.float32)
+            label["age_mask"] = torch.tensor(age_mask, dtype=torch.bool)
+            return {"pid": row["pid"], "data": sample, "label": label}
+
+        data = {
+            "cat_feats": torch.from_numpy(tok_cat),
+            "float_feats": torch.from_numpy(tok_float),
+            "valid_mask": torch.from_numpy(valid_mask),
+            "time_index": torch.from_numpy(time_index),
         }
-        
-        return tensors
+        return {"pid": row["pid"], "data": data, "label": self._read_label(row)}
 
-    def read_sample_label_pretrain(self, chunk_idx: int, within_chunk_idx: int, data: dict):
-        """Feature-level masking for pretraining: mask 50% of valid features per timestamp."""
-        # Read input features
-        tokenized_cat_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'tokenized_category_feats')
-        tokenized_float_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'tokenized_float_feats')
-        valid_mask = self.read_col(chunk_idx, within_chunk_idx, data, 'valid_mask')
-        
-        # Read target features
-        original_cat_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'category_feats')
-        original_float_feats = self.read_col(chunk_idx, within_chunk_idx, data, 'float_feats')
-        
-        n_cat, seq_len = tokenized_cat_feats.shape
-        n_float, seq_len = tokenized_float_feats.shape
-        
-        # Initialize arrays
-        input_cat_values = np.copy(tokenized_cat_feats)
-        input_float_values = np.copy(tokenized_float_feats)
-        input_cat_masks = np.zeros((n_cat, seq_len), dtype=bool)
-        input_float_masks = np.zeros((n_float, seq_len), dtype=bool)
-        
-        output_cat_values = np.zeros((n_cat, seq_len), dtype=np.int64)
-        output_cat_masks = np.zeros((n_cat, seq_len), dtype=bool)
-        output_float_values = np.zeros((n_float, seq_len), dtype=np.float32)
-        output_float_masks = np.zeros((n_float, seq_len), dtype=bool)
-        
-        # Apply masking per timestamp
-        for t in range(seq_len):
+    def _mask_pretrain(self, tok_cat, tok_float, orig_cat, orig_float, valid_mask, time_index):
+        """Dual stochastic masking (paper Stage 2): mask a fraction of the valid
+        features at each visit; reconstruct the masked categorical (CE) and
+        continuous (MSE, normalized) values."""
+        n_cat, L = tok_cat.shape
+        n_float = tok_float.shape[0]
+        input_cat, input_float = tok_cat.copy(), tok_float.copy()
+        input_cat_masks = np.zeros((n_cat, L), dtype=bool)
+        input_float_masks = np.zeros((n_float, L), dtype=bool)
+        out_cat = np.zeros((n_cat, L), dtype=np.int64)
+        out_cat_masks = np.zeros((n_cat, L), dtype=bool)
+        out_float = np.zeros((n_float, L), dtype=np.float32)
+        out_float_masks = np.zeros((n_float, L), dtype=bool)
+
+        for t in range(L):
             if not valid_mask[t]:
                 continue
-                
-            # Find valid features
-            valid_cat_features = [i for i in range(n_cat) if tokenized_cat_feats[i, t] != -1]
-            valid_float_features = [i for i in range(n_float) if tokenized_float_feats[i, t] != -1]
-            all_valid_features = [(i, 'cat') for i in valid_cat_features] + [(i, 'float') for i in valid_float_features]
-            
-            if len(all_valid_features) == 0:
+            valid = [(i, "cat") for i in range(n_cat) if tok_cat[i, t] != -1]
+            valid += [(i, "float") for i in range(n_float) if tok_float[i, t] != -1]
+            if not valid:
                 continue
-                
-            # Randomly mask 50% of features
-            n_features_to_mask = max(1, int(len(all_valid_features) * 0.5))
-            np.random.shuffle(all_valid_features)
-            features_to_mask = all_valid_features[:n_features_to_mask]
-            features_to_keep = all_valid_features[n_features_to_mask:]
-            
-            # Set input masks for unmasked features
-            for feat_idx, feat_type in features_to_keep:
-                if feat_type == 'cat':
-                    input_cat_masks[feat_idx, t] = True
+            k = max(1, int(len(valid) * self.mask_ratio))
+            np.random.shuffle(valid)
+            to_mask, to_keep = valid[:k], valid[k:]
+            for i, ty in to_keep:
+                (input_cat_masks if ty == "cat" else input_float_masks)[i, t] = True
+            for i, ty in to_mask:
+                if ty == "cat":
+                    input_cat[i, t] = -1
+                    out_cat_masks[i, t] = True
+                    out_cat[i, t] = orig_cat[i, t] if orig_cat[i, t] >= 0 else 0
                 else:
-                    input_float_masks[feat_idx, t] = True
-            
-            # Set targets for masked features
-            for feat_idx, feat_type in features_to_mask:
-                if feat_type == 'cat':
-                    input_cat_values[feat_idx, t] = -1
-                    output_cat_masks[feat_idx, t] = True
-                    output_cat_values[feat_idx, t] = original_cat_feats[feat_idx, t]
-                else:
-                    input_float_values[feat_idx, t] = -1
-                    output_float_masks[feat_idx, t] = True
-                    original_value = original_float_feats[feat_idx, t]
-                    if original_value != -1 and not np.isnan(original_value):
-                        if feat_idx < len(self.mean_std):
-                            mean, std = self.mean_std[feat_idx]
-                            normalized_value = (original_value - mean) / (std + 1e-10)
-                            output_float_values[feat_idx, t] = normalized_value
-                        else:
-                            output_float_values[feat_idx, t] = original_value
-                    else:
-                        output_float_values[feat_idx, t] = 0.0
-        
-        output_cat_values[output_cat_values == -1] = 0
-        
+                    input_float[i, t] = -1
+                    out_float_masks[i, t] = True
+                    v = orig_float[i, t]
+                    if not np.isnan(v):
+                        mean, std = self.schema.mean_std[i]
+                        out_float[i, t] = (v - mean) / (std + 1e-10)
+
         sample = {
-            'cat_feats': torch.tensor(input_cat_values, dtype=torch.long),
-            'cat_valid_mask': torch.tensor(input_cat_masks, dtype=torch.bool),
-            'float_feats': torch.tensor(input_float_values, dtype=torch.long),
-            'float_valid_mask': torch.tensor(input_float_masks, dtype=torch.bool)
+            "cat_feats": torch.tensor(input_cat, dtype=torch.long),
+            "cat_valid_mask": torch.tensor(input_cat_masks, dtype=torch.bool),
+            "float_feats": torch.tensor(input_float, dtype=torch.long),
+            "float_valid_mask": torch.tensor(input_float_masks, dtype=torch.bool),
+            "valid_mask": torch.tensor(valid_mask, dtype=torch.bool),
+            "time_index": torch.tensor(time_index, dtype=torch.long),
         }
-        
         label = {
-            'cat_feats': torch.tensor(output_cat_values, dtype=torch.long),
-            'cat_valid_mask': torch.tensor(output_cat_masks, dtype=torch.bool),
-            'float_feats': torch.tensor(output_float_values, dtype=torch.float32),
-            'float_valid_mask': torch.tensor(output_float_masks, dtype=torch.bool)
+            "cat_feats": torch.tensor(out_cat, dtype=torch.long),
+            "cat_valid_mask": torch.tensor(out_cat_masks, dtype=torch.bool),
+            "float_feats": torch.tensor(out_float, dtype=torch.float32),
+            "float_valid_mask": torch.tensor(out_float_masks, dtype=torch.bool),
         }
-        
         return sample, label
 
-    def read_label(self, chunk_idx: int, within_chunk_idx: int, data: dict):
-        is_pretraining = self.config.get('mode') == 'pretrain'
-        if is_pretraining:
-            return None
+    def _read_label(self, row):
         labels = {
-            'cls': {'values': [], 'masks': []},
-            'reg': {'values': [], 'masks': []},
-            'time_index': self.read_col(chunk_idx, within_chunk_idx, data, 'time_index').astype(np.int64)
+            "cls": {"values": [], "masks": []},
+            "reg": {"values": [], "masks": []},
+            "time_index": np.asarray(row["time_index"], dtype=np.int64),
         }
-        for value_col in self.config['cls_label_cols']:
-            values = self.read_col(chunk_idx, within_chunk_idx, data, value_col)
-            if len(values.shape) == 1:
-                values = values.reshape(1, -1)
+        for value_col in self.config["cls_label_cols"]:
+            values = _stack(row[value_col], np.float64)   # [n_category, L]
             for value in values:
                 value = np.nan_to_num(value, nan=-1)
                 mask = (value != -1) & ~np.isnan(value)
-                labels['cls']['values'].append(value)
-                labels['cls']['masks'].append(mask)
-        
-        for value_col in self.config['reg_label_cols']:
-            values = self.read_col(chunk_idx, within_chunk_idx, data, value_col)
-            if len(values.shape) == 1:
-                values = values.reshape(1, -1)
-            for value, (mean, std) in zip(values, self.config['reg_label_info']):
+                labels["cls"]["values"].append(value)
+                labels["cls"]["masks"].append(mask)
+        for value_col, (mean, std) in zip(self.config["reg_label_cols"], self.config["reg_label_info"]):
+            values = _stack(row[value_col], np.float64)   # [n_reg, L]
+            for value in values:
                 value = (value - mean) / std
                 value = np.nan_to_num(value, nan=-1)
                 mask = (value != -1) & ~np.isnan(value)
-                labels['reg']['values'].append(value)
-                labels['reg']['masks'].append(mask)
+                labels["reg"]["values"].append(value)
+                labels["reg"]["masks"].append(mask)
 
-        if labels['cls']['values']:
-            values = torch.tensor(np.stack(labels['cls']['values'], axis=0), dtype=torch.long)
-            values[values == -1] = 0
-            labels['cls']['values'] = values
-            labels['cls']['masks'] = torch.tensor(np.stack(labels['cls']['masks'], axis=0), dtype=torch.bool)
-
-        if labels['reg']['values']:
-            labels['reg']['values'] = torch.tensor(np.stack(labels['reg']['values'], axis=0), dtype=torch.float32)
-            labels['reg']['masks'] = torch.tensor(np.stack(labels['reg']['masks'], axis=0), dtype=torch.bool)
-
-        labels['time_index'] = torch.tensor(labels['time_index'], dtype=torch.long)
+        if labels["cls"]["values"]:
+            v = torch.tensor(np.stack(labels["cls"]["values"]), dtype=torch.long)
+            v[v == -1] = 0
+            labels["cls"]["values"] = v
+            labels["cls"]["masks"] = torch.tensor(np.stack(labels["cls"]["masks"]), dtype=torch.bool)
+        if labels["reg"]["values"]:
+            labels["reg"]["values"] = torch.tensor(np.stack(labels["reg"]["values"]), dtype=torch.float32)
+            labels["reg"]["masks"] = torch.tensor(np.stack(labels["reg"]["masks"]), dtype=torch.bool)
+        labels["time_index"] = torch.tensor(labels["time_index"], dtype=torch.long)
         return labels
 
-    def __len__(self):
-        return self.total_length
-
-    def __getitem__(self, idx):
-        
-        chunk_idx = np.searchsorted(self.cumulative_lengths, idx, side='right')
-        if chunk_idx > 0:
-            within_chunk_idx = idx - self.cumulative_lengths[chunk_idx - 1]
-        else:
-            within_chunk_idx = idx
-            
-        
-        if self.use_cache:
-            pid = self.data_chunks[chunk_idx].iloc[within_chunk_idx]['pid']
-            data = self.get_from_cache(pid)
-        else:
-            data = None
-        
-        is_pretraining = self.config.get('mode') == 'pretrain'
-        
-        if is_pretraining:
-            sample, label = self.read_sample_label_pretrain(chunk_idx, within_chunk_idx, data)
-            return {
-                'pid': self.read_col(chunk_idx, within_chunk_idx, data, 'pid'),
-                'data': sample,
-                'label': label
-            }
-        else:
-            return {
-                'pid': self.read_col(chunk_idx, within_chunk_idx, data, 'pid'),
-                'data': self.read_sample(chunk_idx, within_chunk_idx, data),
-                'label': self.read_label(chunk_idx, within_chunk_idx, data)
-            }
 
 class EHRDataModule(pl.LightningDataModule):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.df_paths = config.get('df_paths', [])  
-        self.use_cache = config.get('use_cache', False)
-        self.dataset_col = config.get('dataset_col', None)
-        self.batch_size = config.get('batch_size', None)
-        self.train_folds = config.get('train_folds', None)
-        self.valid_folds = config.get('valid_folds', None)
-        self.test_folds = config.get('test_folds', None)
-        self.chunk_size = config.get('chunk_size', 1000000)
+        self.df_paths = config.get("df_paths", [])
+        self.dataset_col = config.get("dataset_col", "dataset_fold10")
+        self.batch_size = config.get("batch_size", 32)
+        self.num_workers = config.get("num_workers", 4)
+        self.train_folds = config.get("train_folds")
+        self.valid_folds = config.get("valid_folds")
+        self.test_folds = config.get("test_folds")
+        self.mode = "pretrain" if config.get("mode") == "pretrain" else "finetune"
+        # expose cohort count + age stats on the config before the model is built
+        try:
+            with open(config["feat_info_path"]) as f:
+                fi = json.load(f)
+            config.setdefault("n_cohorts", int(fi.get("n_cohorts", 1)))
+            config.setdefault("age_mean", float(fi.get("age_mean", 0.0)))
+            config.setdefault("age_std", float(fi.get("age_std", 1.0)))
+        except (KeyError, FileNotFoundError):
+            pass
 
     def setup(self, stage=None):
-        if not isinstance(self.df_paths, list):
-            self.df_paths = [self.df_paths]
-        if isinstance(self.df_paths[0], pd.DataFrame):
-            self._setup_from_dataframe()
-        else:
-            self._setup_from_parquet()
+        paths = self.df_paths if isinstance(self.df_paths, list) else [self.df_paths]
+        df = pd.concat([load_parquet(Path(p) / "data.parquet") for p in sorted(paths)], ignore_index=True)
+        schema = FeatureSchema.from_config(self.config)
+        tr = df[df[self.dataset_col].isin(self.train_folds)]
+        va = df[df[self.dataset_col].isin(self.valid_folds)]
+        te = df[df[self.dataset_col].isin(self.test_folds)]
+        self.ds_train = EHRDataset(tr, schema, self.config, self.mode)
+        self.ds_valid = EHRDataset(va, schema, self.config, self.mode)
+        self.ds_test = EHRDataset(te, schema, self.config, self.mode)
 
-    def _setup_from_dataframe(self):
-        df = pd.concat(sorted(self.df_paths), axis=0, ignore_index=True)
-        df = optimize_dtypes(df)
-        
-        
-        df_train = df[df[self.dataset_col].isin(self.train_folds)].reset_index(drop=True)
-        df_valid = df[df[self.dataset_col].isin(self.valid_folds)].reset_index(drop=True)
-        df_test = df[df[self.dataset_col].isin(self.test_folds)].reset_index(drop=True)
-        
-        
-        self.config['df_paths'] = self.df_paths  
-        
-        
-        self.ds_train = ChunkedEHRDataset([df_train], 'train', self.config)
-        self.ds_valid = ChunkedEHRDataset([df_valid], 'valid', self.config)
-        self.ds_test = ChunkedEHRDataset([df_test], 'test', self.config)
-
-    def _setup_from_parquet(self):
-        dfs = []
-        for path in sorted(self.df_paths):
-            metadata_path = Path(path) / 'metadata.parquet'
-            df = load_parquet(metadata_path)
-            dfs.append(df)
-        
-        
-        merged_df = pd.concat(dfs, axis=0, ignore_index=True)
-        merged_df = optimize_dtypes(merged_df)
-        
-        
-        df_train = merged_df[merged_df[self.dataset_col].isin(self.train_folds)].reset_index(drop=True)
-        df_valid = merged_df[merged_df[self.dataset_col].isin(self.valid_folds)].reset_index(drop=True)
-        df_test = merged_df[merged_df[self.dataset_col].isin(self.test_folds)].reset_index(drop=True)
-        
-        
-        self.config['df_paths'] = self.df_paths
-        
-        
-        self.ds_train = ChunkedEHRDataset([df_train], 'train', self.config)
-        self.ds_valid = ChunkedEHRDataset([df_valid], 'valid', self.config)
-        
-        if self.config.get('test_df', '') != '':
-            df_test = pd.read_csv(self.config['test_df'])
-            df_test = optimize_dtypes(df_test)
-            self.ds_test = ChunkedEHRDataset([df_test], 'test', self.config)
-        else:
-            self.ds_test = ChunkedEHRDataset([df_test], 'test', self.config)
+    def _loader(self, ds, shuffle):
+        return DataLoader(ds, batch_size=self.batch_size, num_workers=self.num_workers,
+                          pin_memory=True, shuffle=shuffle)
 
     def train_dataloader(self):
-        return DataLoader(
-            self.ds_train,
-            batch_size=self.batch_size,
-            num_workers=8,
-            pin_memory=True,
-            shuffle=True,
-            persistent_workers=True,
-            prefetch_factor=8,
-            multiprocessing_context='fork'
-        )
+        return self._loader(self.ds_train, True)
 
     def val_dataloader(self):
-        return DataLoader(
-            self.ds_valid,
-            batch_size=self.batch_size,
-            num_workers=8,
-            pin_memory=True,
-            shuffle=False,
-            persistent_workers=True,
-            prefetch_factor=8,
-            multiprocessing_context='fork'
-        )
+        return self._loader(self.ds_valid, False)
 
     def test_dataloader(self):
-        return DataLoader(
-            self.ds_test,
-            batch_size=self.batch_size,
-            num_workers=8,
-            pin_memory=True,
-            shuffle=False,
-            persistent_workers=True,
-            prefetch_factor=8,
-            multiprocessing_context='fork'
-        )
+        return self._loader(self.ds_test, False)
 
     def teardown(self, stage=None):
-        gc.collect()
+        pass
